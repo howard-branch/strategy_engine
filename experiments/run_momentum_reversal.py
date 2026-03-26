@@ -53,7 +53,7 @@ def main() -> None:
     df["z_mom"] = SignalBase.zscore_by_date(df, "score_mom")
     df["z_rev"] = SignalBase.zscore_by_date(df, "score_rev")
 
-    df["score"] = df["z_mom"] + df["z_rev"]
+    df["score"] = df["z_mom"] + 0.1 * df["z_rev"]
 
     combined_scores = df[["date", "symbol", "score"]]
     print(f"Combined scores: {len(combined_scores)} rows, {combined_scores['date'].nunique()} unique dates")
