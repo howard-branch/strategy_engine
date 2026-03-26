@@ -47,7 +47,8 @@ def simulate_backtest(
     )
 
     turnover = weights_wide.diff().abs().sum(axis=1)
-    turnover.iloc[0] = weights_wide.iloc[0].abs().sum()
+    if len(weights_wide) > 0:
+        turnover.iloc[0] = weights_wide.iloc[0].abs().sum()
 
     turnover = turnover.rename("turnover").reset_index()
 

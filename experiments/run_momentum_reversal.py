@@ -56,16 +56,21 @@ def main() -> None:
     df["score"] = df["z_mom"] + df["z_rev"]
 
     combined_scores = df[["date", "symbol", "score"]]
+    print(f"Combined scores: {len(combined_scores)} rows, {combined_scores['date'].nunique()} unique dates")
 
     # Group by week and take last day of each week
     combined_scores["week"] = combined_scores["date"].dt.to_period("W")
     
-    frames = []
-    for week, week_data in combined_scores.groupby("week"):
-        day = week_data.sort_values("date").iloc[-1:]  # last day of week
-        frames.append(day)
+    # Get the last trading date in each week, then filter to that date
+    last_date_per_week = combined_scores.groupby("week")["date"].max()
+    weekly_scores = combined_scores[combined_scores["date"].isin(last_date_per_week.values)][["date", "symbol", "score"]].copy()
     
-    weekly_scores = pd.concat(frames, ignore_index=True)[["date", "symbol", "score"]]
+    if len(weekly_scores) == 0:
+        print("No data after weekly aggregation")
+        return
+    
+    print(f"Weekly scores: {len(weekly_scores)} rows, {weekly_scores['date'].nunique()} unique dates")
+    print(f"Stocks per date - min: {weekly_scores.groupby('date').size().min()}, max: {weekly_scores.groupby('date').size().max()}, mean: {weekly_scores.groupby('date').size().mean():.1f}")
 
     weights = construct_rank_based_portfolio(
         weekly_scores,
@@ -75,6 +80,11 @@ def main() -> None:
             gross_short=0.5,
         ),
     )
+    print(f"Weights: {len(weights)} rows, {weights['date'].nunique() if len(weights) > 0 else 0} unique dates")
+
+    if len(weights) == 0:
+        print("No positions after portfolio construction. Portfolio requires at least 10 stocks per date.")
+        return
 
     backtest_daily = simulate_backtest(
         weights=weights,
