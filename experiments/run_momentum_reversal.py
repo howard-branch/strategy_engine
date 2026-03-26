@@ -72,14 +72,18 @@ def main() -> None:
     print(f"Weekly scores: {len(weekly_scores)} rows, {weekly_scores['date'].nunique()} unique dates")
     print(f"Stocks per date - min: {weekly_scores.groupby('date').size().min()}, max: {weekly_scores.groupby('date').size().max()}, mean: {weekly_scores.groupby('date').size().mean():.1f}")
 
-    weights = construct_rank_based_portfolio(
-        weekly_scores,
-        PortfolioConfig(
-            top_n=5,
-            gross_long=0.5,
-            gross_short=0.5,
-        ),
+    config = PortfolioConfig(
+        top_n=10,
+        entry_n=10,
+        exit_n=20,
+        gross_long=0.5,
+        gross_short=0.5,
+        rebalance_frequency="W-FRI",
+        min_names_per_side=5,
+        allow_flips_same_day=False,
     )
+    weights = construct_rank_based_portfolio(weekly_scores, config)
+
     print(f"Weights: {len(weights)} rows, {weights['date'].nunique() if len(weights) > 0 else 0} unique dates")
 
     if len(weights) == 0:
