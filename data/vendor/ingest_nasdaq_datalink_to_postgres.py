@@ -640,10 +640,10 @@ def main(argv: Iterable[str]) -> int:
     args = parse_args(argv)
 
     if not args.api_key:
-        print("Missing API key. Set NDL_API_KEY or pass --api-key.", file=sys.stderr)
+        print("Missing API key. Set NDL_API_KEY in .env or pass --api-key.", file=sys.stderr)
         return 2
     if not args.db_dsn:
-        print("Missing DB DSN. Set DATABASE_URL / PG_DSN or pass --db-dsn.", file=sys.stderr)
+        print("Missing DB DSN. Set DATABASE_URL or PG_DSN in .env or pass --db-dsn.", file=sys.stderr)
         return 2
 
     config = Config(
