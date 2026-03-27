@@ -506,8 +506,14 @@ def iter_ticker_rows(csv_file: io.TextIOBase) -> Iterator[tuple]:
 def iter_bar_rows(csv_file: io.TextIOBase, default_source_table: str) -> Iterator[tuple]:
     reader = csv.DictReader(csv_file)
     reader.fieldnames = [normalise_header(x) for x in (reader.fieldnames or [])]
+    
+    # Debug: print column names on first iteration
+    _debug_printed = False
 
     for row in reader:
+        if not _debug_printed:
+            print(f"[debug] CSV columns: {reader.fieldnames}")
+            _debug_printed = True
         symbol = row_get(row, "ticker", "symbol")
         trade_date = row_get(row, "date", "trade_date")
         if not symbol or not trade_date:
@@ -646,12 +652,11 @@ def ingest_bars_for_table(
         table: str,
 ) -> None:
     # Validate that the table is supported for bar data ingestion
-    supported_tables = {"SHARADAR/SEP", "SHARADAR/SFP"}
-    if table not in supported_tables:
+    supported_bar_tables = {"SHARADAR/SEP", "SHARADAR/SFP", "SHARADAR/DAILY"}
+    if table not in supported_bar_tables:
         raise ValueError(
-            f"Table '{table}' does not exist or is not supported for bar data ingestion. "
-            f"Valid tables: {', '.join(sorted(supported_tables))}. "
-            f"For daily OHLCV data, use load_history.py (Yahoo Finance) or other data vendors."
+            f"Table {table!r} does not exist or is not supported for bar data ingestion. "
+            f"Valid tables: {', '.join(sorted(supported_bar_tables))}."
         )
     
     print(f"[info] downloading {table}...")
