@@ -38,6 +38,75 @@ class Config:
     request_timeout_connect: int = 30
     request_timeout_read: int = 300
 
+def get_bulk_export_link(
+        session: requests.Session,
+        datatable_code: str,
+        api_key: str,
+        poll_seconds: int = 5,
+        max_wait_seconds: int = 300,
+) -> str:
+    """
+    Call Nasdaq Data Link bulk export endpoint until file.status == Fresh,
+    then return file.link.
+    """
+    url = (
+        f"https://data.nasdaq.com/api/v3/datatables/{datatable_code}.csv"
+        f"?qopts.export=true&api_key={api_key}"
+    )
+
+    deadline = time.time() + max_wait_seconds
+
+    while True:
+        resp = session.get(url, timeout=(30, 300))
+        resp.raise_for_status()
+        text = resp.text
+
+        reader = csv.DictReader(io.StringIO(text))
+        row = next(reader, None)
+        if row is None:
+            raise RuntimeError(f"No metadata row returned for bulk export {datatable_code}")
+
+        link = (row.get("file.link") or "").strip()
+        status = (row.get("file.status") or "").strip()
+
+        print(f"[debug] bulk export {datatable_code}: status={status!r}, link_present={bool(link)}")
+
+        # Fresh = ready to download
+        if status.lower() == "fresh":
+            if not link:
+                raise RuntimeError(f"Bulk export {datatable_code} is Fresh but file.link is empty")
+            return link
+
+        # Creating / Regenerating = wait and poll again
+        if status.lower() in {"creating", "regenerating"}:
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for Nasdaq export {datatable_code} to become Fresh"
+                )
+            time.sleep(poll_seconds)
+            continue
+
+        raise RuntimeError(
+            f"Unexpected bulk export status for {datatable_code}: {status!r}; row={row}"
+        )
+
+def download_bulk_zip_bytes(
+        session: requests.Session,
+        datatable_code: str,
+        api_key: str,
+) -> bytes:
+    link = get_bulk_export_link(session, datatable_code, api_key)
+    resp = session.get(link, timeout=(30, 600))
+    resp.raise_for_status()
+    data = resp.content
+
+    if not data.startswith(b"PK"):
+        raise RuntimeError(
+            f"Downloaded bulk file for {datatable_code} is not a ZIP; "
+            f"first 200 bytes={data[:200]!r}"
+        )
+
+    return data
 
 def build_export_url(table: str, api_key: str) -> str:
     return f"{BASE_URL.format(table=table)}?qopts.export=true&api_key={api_key}"
@@ -204,6 +273,11 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
             ON {schema}.daily_bars (instrument_id, trade_date)
             """
         )
+
+        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS source_table TEXT")
+        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL ""DEFAULT NOW()")
+        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL ""DEFAULT NOW()"
+)
 
     conn.commit()
 
@@ -403,7 +477,10 @@ def download_zip_bytes(session: requests.Session, url: str, config: Config) -> b
             max_attempts=config.download_retries,
             timeout=(config.request_timeout_connect, config.request_timeout_read),
     ) as resp:
-        return resp.content
+        data = resp.content
+        print(f"[debug] first 500 bytes: {data[:500]!r}")
+        print(f"[debug] size: {len(data):,} bytes")
+        return data
 
 
 def ingest_tickers(session: requests.Session, conn: psycopg.Connection, config: Config) -> None:
