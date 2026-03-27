@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import sys
+import time
+import zipfile
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+import dotenv
+import psycopg
+import requests
+
+# Load .env file from project root
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_ENV_FILE = _PROJECT_ROOT / ".env"
+if _ENV_FILE.exists():
+    dotenv.load_dotenv(_ENV_FILE)
+
+
+BASE_URL = "https://data.nasdaq.com/api/v3/datatables/{table}.csv"
+DEFAULT_TABLES = ["SHARADAR/TICKERS", "SHARADAR/SEP", "SHARADAR/SFP"]
+
+
+@dataclass
+class Config:
+    api_key: str
+    db_dsn: str
+    schema: str = "strategy_engine"
+    batch_size: int = 10_000
+    download_retries: int = 5
+    request_timeout_connect: int = 30
+    request_timeout_read: int = 300
+
+
+def build_export_url(table: str, api_key: str) -> str:
+    return f"{BASE_URL.format(table=table)}?qopts.export=true&api_key={api_key}"
+
+
+def request_with_retries(
+        session: requests.Session,
+        url: str,
+        max_attempts: int,
+        timeout: tuple[int, int],
+) -> requests.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.get(url, stream=True, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt == max_attempts:
+                break
+            sleep_s = min(2 ** attempt, 30)
+            print(f"[warn] request failed ({attempt}/{max_attempts}): {exc}")
+            print(f"[info] retrying in {sleep_s}s...")
+            time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
+
+
+def first_csv_from_response_bytes(data: bytes) -> io.TextIOBase:
+    """
+    Handle both ZIP (bulk export) and direct CSV responses.
+    """
+
+    # Case 1: ZIP file
+    if data[:2] == b"PK":  # ZIP magic header
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise RuntimeError("Zip file did not contain a CSV")
+        return io.TextIOWrapper(zf.open(csv_names[0], "r"), encoding="utf-8", newline="")
+
+    # Case 2: CSV directly
+    text = data.decode("utf-8", errors="ignore")
+
+    # Detect JSON error
+    if text.strip().startswith("{"):
+        raise RuntimeError(f"Nasdaq returned JSON (likely error): {text[:500]}")
+
+    # Detect HTML error
+    if "<html" in text.lower():
+        raise RuntimeError(f"Nasdaq returned HTML (likely error page): {text[:500]}")
+
+    # Otherwise assume CSV
+    return io.StringIO(text)
+
+def normalise_header(name: str) -> str:
+    return name.strip().lower().replace(" ", "_")
+
+
+def row_get(row: dict[str, str], *names: str) -> Optional[str]:
+    for name in names:
+        key = normalise_header(name)
+        if key in row:
+            value = row[key]
+            if value is None:
+                return None
+            value = value.strip()
+            return value if value != "" else None
+    return None
+
+
+def parse_bool(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    v = value.strip().lower()
+    if v in {"true", "t", "1", "y", "yes"}:
+        return True
+    if v in {"false", "f", "0", "n", "no"}:
+        return False
+    return default
+
+
+def parse_decimal(value: Optional[str]) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(value)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def parse_int(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        # volume sometimes arrives as "12345.0"
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+def chunked(rows: Iterable[tuple], size: int) -> Iterator[list[tuple]]:
+    buf: list[tuple] = []
+    for row in rows:
+        buf.append(row)
+        if len(buf) >= size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
+def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {schema}.instruments (
+                instrument_id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL UNIQUE,
+                name TEXT,
+                exchange TEXT,
+                instrument_type TEXT,
+                source_table TEXT,
+                category TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {schema}.daily_bars (
+                instrument_id BIGINT NOT NULL REFERENCES {schema}.instruments(instrument_id),
+                trade_date DATE NOT NULL,
+                open NUMERIC(18, 6),
+                high NUMERIC(18, 6),
+                low NUMERIC(18, 6),
+                close NUMERIC(18, 6),
+                adj_close NUMERIC(18, 6),
+                volume BIGINT,
+                source_table TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (instrument_id, trade_date)
+            )
+            """
+        )
+
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS daily_bars_trade_date_idx
+            ON {schema}.daily_bars (trade_date)
+            """
+        )
+
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS daily_bars_instrument_date_idx
+            ON {schema}.daily_bars (instrument_id, trade_date)
+            """
+        )
+
+    conn.commit()
+
+
+def create_staging_tables(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS stg_tickers")
+        cur.execute("DROP TABLE IF EXISTS stg_bars")
+
+        cur.execute(
+            """
+            CREATE TEMP TABLE stg_tickers (
+                symbol TEXT,
+                name TEXT,
+                exchange TEXT,
+                instrument_type TEXT,
+                source_table TEXT,
+                category TEXT,
+                is_active BOOLEAN
+            ) ON COMMIT DROP
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TEMP TABLE stg_bars (
+                symbol TEXT,
+                trade_date DATE,
+                open NUMERIC(18, 6),
+                high NUMERIC(18, 6),
+                low NUMERIC(18, 6),
+                close NUMERIC(18, 6),
+                adj_close NUMERIC(18, 6),
+                volume BIGINT,
+                source_table TEXT
+            ) ON COMMIT DROP
+            """
+        )
+
+
+def copy_rows(
+        conn: psycopg.Connection,
+        table_name: str,
+        columns: list[str],
+        rows: Iterable[tuple],
+) -> int:
+    total = 0
+    with conn.cursor() as cur:
+        with cur.copy(
+                f"COPY {table_name} ({', '.join(columns)}) FROM STDIN"
+        ) as copy:
+            for row in rows:
+                copy.write_row(row)
+                total += 1
+    return total
+
+
+def upsert_instruments(conn: psycopg.Connection, schema: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.instruments
+                (symbol, name, exchange, instrument_type, source_table, category, is_active, updated_at)
+            SELECT
+                s.symbol,
+                s.name,
+                s.exchange,
+                s.instrument_type,
+                s.source_table,
+                s.category,
+                s.is_active,
+                NOW()
+            FROM stg_tickers s
+            WHERE s.symbol IS NOT NULL
+            ON CONFLICT (symbol) DO UPDATE
+            SET
+                name = EXCLUDED.name,
+                exchange = EXCLUDED.exchange,
+                instrument_type = EXCLUDED.instrument_type,
+                source_table = EXCLUDED.source_table,
+                category = EXCLUDED.category,
+                is_active = EXCLUDED.is_active,
+                updated_at = NOW()
+            """
+        )
+    conn.commit()
+
+
+def upsert_bars(conn: psycopg.Connection, schema: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.daily_bars
+                (instrument_id, trade_date, open, high, low, close, adj_close, volume, source_table, updated_at)
+            SELECT
+                i.instrument_id,
+                s.trade_date,
+                s.open,
+                s.high,
+                s.low,
+                s.close,
+                s.adj_close,
+                s.volume,
+                s.source_table,
+                NOW()
+            FROM stg_bars s
+            JOIN {schema}.instruments i
+              ON i.symbol = s.symbol
+            WHERE s.symbol IS NOT NULL
+              AND s.trade_date IS NOT NULL
+            ON CONFLICT (instrument_id, trade_date) DO UPDATE
+            SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                adj_close = EXCLUDED.adj_close,
+                volume = EXCLUDED.volume,
+                source_table = EXCLUDED.source_table,
+                updated_at = NOW()
+            """
+        )
+    conn.commit()
+
+
+def iter_ticker_rows(csv_file: io.TextIOBase) -> Iterator[tuple]:
+    reader = csv.DictReader(csv_file)
+    reader.fieldnames = [normalise_header(x) for x in (reader.fieldnames or [])]
+
+    for row in reader:
+        symbol = row_get(row, "ticker", "symbol")
+        if not symbol:
+            continue
+
+        # Sharadar TICKERS usually has table/category/name/exchange/isdelisted-ish metadata.
+        name = row_get(row, "name")
+        exchange = row_get(row, "exchange")
+        source_table = row_get(row, "table")
+        category = row_get(row, "category", "sector")
+        instrument_type = row_get(row, "type", "security_type", "asset_type", "category")
+
+        is_delisted = row_get(row, "isdelisted", "is_delisted", "delisted")
+        is_active = not parse_bool(is_delisted, default=False)
+
+        yield (
+            symbol,
+            name,
+            exchange,
+            instrument_type,
+            source_table,
+            category,
+            is_active,
+        )
+
+
+def iter_bar_rows(csv_file: io.TextIOBase, default_source_table: str) -> Iterator[tuple]:
+    reader = csv.DictReader(csv_file)
+    reader.fieldnames = [normalise_header(x) for x in (reader.fieldnames or [])]
+
+    for row in reader:
+        symbol = row_get(row, "ticker", "symbol")
+        trade_date = row_get(row, "date", "trade_date")
+        if not symbol or not trade_date:
+            continue
+
+        open_ = parse_decimal(row_get(row, "open"))
+        high = parse_decimal(row_get(row, "high"))
+        low = parse_decimal(row_get(row, "low"))
+        close = parse_decimal(row_get(row, "close"))
+        # Sharadar commonly has closeadj; keep a few aliases.
+        adj_close = parse_decimal(row_get(row, "closeadj", "adj_close", "adjusted_close", "close_adjusted"))
+        volume = parse_int(row_get(row, "volume"))
+        source_table = row_get(row, "table") or default_source_table
+
+        if close is None:
+            continue
+        if adj_close is None:
+            adj_close = close
+
+        yield (
+            symbol,
+            trade_date,
+            open_,
+            high,
+            low,
+            close,
+            adj_close,
+            volume,
+            source_table,
+        )
+
+
+def download_zip_bytes(session: requests.Session, url: str, config: Config) -> bytes:
+    with request_with_retries(
+            session,
+            url,
+            max_attempts=config.download_retries,
+            timeout=(config.request_timeout_connect, config.request_timeout_read),
+    ) as resp:
+        return resp.content
+
+
+def ingest_tickers(session: requests.Session, conn: psycopg.Connection, config: Config) -> None:
+    print("[info] downloading SHARADAR/TICKERS...")
+    data = download_zip_bytes(session, build_export_url("SHARADAR/TICKERS", config.api_key), config)
+    csv_file = first_csv_from_response_bytes(data)
+
+    create_staging_tables(conn)
+    count = copy_rows(
+        conn,
+        "stg_tickers",
+        ["symbol", "name", "exchange", "instrument_type", "source_table", "category", "is_active"],
+        iter_ticker_rows(csv_file),
+    )
+    print(f"[info] copied {count:,} ticker rows to staging")
+    upsert_instruments(conn, config.schema)
+    print("[ok] upserted instruments")
+
+
+def ingest_bars_for_table(
+        session: requests.Session,
+        conn: psycopg.Connection,
+        config: Config,
+        table: str,
+) -> None:
+    print(f"[info] downloading {table}...")
+    data = download_zip_bytes(session, build_export_url(table, config.api_key), config)
+    csv_file = first_csv_from_response_bytes(data)
+
+    create_staging_tables(conn)
+    count = copy_rows(
+        conn,
+        "stg_bars",
+        ["symbol", "trade_date", "open", "high", "low", "close", "adj_close", "volume", "source_table"],
+        iter_bar_rows(csv_file, default_source_table=table),
+    )
+    print(f"[info] copied {count:,} bar rows from {table} to staging")
+    upsert_bars(conn, config.schema)
+    print(f"[ok] upserted daily_bars from {table}")
+
+
+def parse_args(argv: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download Sharadar data and store directly in Postgres")
+    parser.add_argument("--api-key", default=os.getenv("NDL_API_KEY") or os.getenv("NASDAQ_DATA_LINK_API_KEY"))
+    parser.add_argument("--db-dsn", default=os.getenv("DATABASE_URL") or os.getenv("PG_DSN"))
+    parser.add_argument("--schema", default=os.getenv("DB_SCHEMA", "strategy_engine"))
+    parser.add_argument(
+        "--tables",
+        nargs="+",
+        default=DEFAULT_TABLES,
+        help="Subset of tables to ingest. Default: SHARADAR/TICKERS SHARADAR/SEP SHARADAR/SFP",
+    )
+    return parser.parse_args(list(argv))
+
+
+def main(argv: Iterable[str]) -> int:
+    args = parse_args(argv)
+
+    if not args.api_key:
+        print("Missing API key. Set NDL_API_KEY or pass --api-key.", file=sys.stderr)
+        return 2
+    if not args.db_dsn:
+        print("Missing DB DSN. Set DATABASE_URL / PG_DSN or pass --db-dsn.", file=sys.stderr)
+        return 2
+
+    config = Config(
+        api_key=args.api_key,
+        db_dsn=args.db_dsn,
+        schema=args.schema,
+    )
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "strategy-engine-sharadar-ingest/1.0",
+            "Accept": "*/*",
+        }
+    )
+
+    with psycopg.connect(config.db_dsn, autocommit=False) as conn:
+        ensure_schema(conn, config.schema)
+
+        if "SHARADAR/TICKERS" in args.tables:
+            ingest_tickers(session, conn, config)
+
+        for table in args.tables:
+            if table == "SHARADAR/TICKERS":
+                continue
+            ingest_bars_for_table(session, conn, config, table)
+
+    print("[summary] finished successfully")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
