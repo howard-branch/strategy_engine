@@ -244,6 +244,7 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
             CREATE TABLE IF NOT EXISTS {schema}.instruments (
                 instrument_id BIGSERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL UNIQUE,
+                asset_type TEXT NOT NULL DEFAULT 'STOCK',
                 name TEXT,
                 exchange TEXT,
                 instrument_type TEXT,
@@ -255,6 +256,16 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
             )
             """
         )
+
+        cur.execute(f"ALTER TABLE {schema}.instruments ADD COLUMN IF NOT EXISTS asset_type TEXT")
+        cur.execute(
+            f"""
+            UPDATE {schema}.instruments
+            SET asset_type = COALESCE(asset_type, instrument_type, 'STOCK')
+            WHERE asset_type IS NULL
+            """
+        )
+        cur.execute(f"ALTER TABLE {schema}.instruments ALTER COLUMN asset_type SET DEFAULT 'STOCK'")
 
         cur.execute(
             f"""
@@ -318,6 +329,7 @@ def create_staging_tables(conn: psycopg.Connection) -> None:
             """
             CREATE TEMP TABLE stg_tickers (
                 symbol TEXT,
+                asset_type TEXT,
                 name TEXT,
                 exchange TEXT,
                 instrument_type TEXT,
@@ -361,15 +373,40 @@ def copy_rows(
                 total += 1
     return total
 
+def infer_asset_type(source_table, instrument_type, category):
+    st = (source_table or "").upper()
+    it = (instrument_type or "").upper()
+    cat = (category or "").upper()
+
+    if st == "SFP":
+        return "FUND"
+    if st in {"SEP", "DAILY"}:
+        return "STOCK"
+    if "ETF" in it or "ETF" in cat:
+        return "ETF"
+    if "FUND" in it or "FUND" in cat:
+        return "FUND"
+    return "STOCK"
 
 def upsert_instruments(conn: psycopg.Connection, schema: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            INSERT INTO {schema}.instruments
-                (symbol, name, exchange, instrument_type, source_table, category, is_active, updated_at)
+              INSERT INTO {schema}.instruments (
+                symbol,
+                asset_type,
+                name,
+                exchange,
+                instrument_type,
+                source_table,
+                category,
+                is_active,
+                updated_at
+            )
+           
             SELECT DISTINCT ON (s.symbol)
                 s.symbol,
+                s.asset_type,
                 s.name,
                 s.exchange,
                 s.instrument_type,
@@ -383,6 +420,7 @@ def upsert_instruments(conn: psycopg.Connection, schema: str) -> None:
             ON CONFLICT (symbol) DO UPDATE
             SET
                 name = EXCLUDED.name,
+                asset_type = COALESCE(EXCLUDED.asset_type, {schema}.instruments.asset_type),
                 exchange = EXCLUDED.exchange,
                 instrument_type = EXCLUDED.instrument_type,
                 source_table = EXCLUDED.source_table,
@@ -447,6 +485,7 @@ def iter_ticker_rows(csv_file: io.TextIOBase) -> Iterator[tuple]:
         source_table = row_get(row, "table")
         category = row_get(row, "category", "sector")
         instrument_type = row_get(row, "type", "security_type", "asset_type", "category")
+        asset_type = infer_asset_type(source_table, instrument_type, category)
 
         is_delisted = row_get(row, "isdelisted", "is_delisted", "delisted")
         is_active = not parse_bool(is_delisted, default=False)
@@ -455,6 +494,7 @@ def iter_ticker_rows(csv_file: io.TextIOBase) -> Iterator[tuple]:
             symbol,
             name,
             exchange,
+            asset_type,
             instrument_type,
             source_table,
             category,
@@ -587,8 +627,8 @@ def ingest_tickers(session: requests.Session, conn: psycopg.Connection, config: 
     count = copy_rows(
         conn,
         "stg_tickers",
-        ["symbol", "name", "exchange", "instrument_type", "source_table", "category", "is_active"],
-        iter_ticker_rows(csv_file),
+        ["symbol", "name", "exchange", "asset_type", "instrument_type", "source_table", "category", "is_active"],
+        iter_ticker_rows(csv_file)
     )
     if count == 0:
         raise RuntimeError("Parsed zero ticker rows from SHARADAR/TICKERS export")
