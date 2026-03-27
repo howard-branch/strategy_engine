@@ -37,6 +37,7 @@ class Config:
     download_retries: int = 5
     request_timeout_connect: int = 30
     request_timeout_read: int = 300
+    overwrite: bool = False
 
 def get_bulk_export_link(
         session: requests.Session,
@@ -220,6 +221,15 @@ def chunked(rows: Iterable[tuple], size: int) -> Iterator[list[tuple]]:
         yield buf
 
 
+def truncate_tables(conn: psycopg.Connection, schema: str) -> None:
+    """Truncate all data from instruments and daily_bars tables."""
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE TABLE {schema}.daily_bars CASCADE")
+        cur.execute(f"TRUNCATE TABLE {schema}.instruments CASCADE")
+    conn.commit()
+    print("[info] truncated existing data")
+
+
 def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
@@ -246,11 +256,11 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
             CREATE TABLE IF NOT EXISTS {schema}.daily_bars (
                 instrument_id BIGINT NOT NULL REFERENCES {schema}.instruments(instrument_id),
                 trade_date DATE NOT NULL,
-                open NUMERIC(18, 6),
-                high NUMERIC(18, 6),
-                low NUMERIC(18, 6),
-                close NUMERIC(18, 6),
-                adj_close NUMERIC(18, 6),
+                open NUMERIC(30, 6),
+                high NUMERIC(30, 6),
+                low NUMERIC(30, 6),
+                close NUMERIC(30, 6),
+                adj_close NUMERIC(30, 6),
                 volume BIGINT,
                 source_table TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -275,9 +285,21 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
         )
 
         cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS source_table TEXT")
-        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL ""DEFAULT NOW()")
-        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL ""DEFAULT NOW()"
-)
+        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        cur.execute(f"ALTER TABLE {schema}.daily_bars ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        
+        # Ensure volume column allows NULL (in case table was created with old schema)
+        try:
+            cur.execute(f"ALTER TABLE {schema}.daily_bars ALTER COLUMN volume DROP NOT NULL")
+        except Exception:
+            pass
+        
+        # Update numeric column precision from (18,6) to (30,6) if needed for old schemas
+        for col in ["open", "high", "low", "close", "adj_close"]:
+            try:
+                cur.execute(f"ALTER TABLE {schema}.daily_bars ALTER COLUMN {col} TYPE NUMERIC(30, 6)")
+            except Exception:
+                pass
 
     conn.commit()
 
@@ -306,11 +328,11 @@ def create_staging_tables(conn: psycopg.Connection) -> None:
             CREATE TEMP TABLE stg_bars (
                 symbol TEXT,
                 trade_date DATE,
-                open NUMERIC(18, 6),
-                high NUMERIC(18, 6),
-                low NUMERIC(18, 6),
-                close NUMERIC(18, 6),
-                adj_close NUMERIC(18, 6),
+                open NUMERIC(30, 6),
+                high NUMERIC(30, 6),
+                low NUMERIC(30, 6),
+                close NUMERIC(30, 6),
+                adj_close NUMERIC(30, 6),
                 volume BIGINT,
                 source_table TEXT
             ) ON COMMIT DROP
@@ -341,7 +363,7 @@ def upsert_instruments(conn: psycopg.Connection, schema: str) -> None:
             f"""
             INSERT INTO {schema}.instruments
                 (symbol, name, exchange, instrument_type, source_table, category, is_active, updated_at)
-            SELECT
+            SELECT DISTINCT ON (s.symbol)
                 s.symbol,
                 s.name,
                 s.exchange,
@@ -352,6 +374,7 @@ def upsert_instruments(conn: psycopg.Connection, schema: str) -> None:
                 NOW()
             FROM stg_tickers s
             WHERE s.symbol IS NOT NULL
+            ORDER BY s.symbol
             ON CONFLICT (symbol) DO UPDATE
             SET
                 name = EXCLUDED.name,
@@ -372,7 +395,7 @@ def upsert_bars(conn: psycopg.Connection, schema: str) -> None:
             f"""
             INSERT INTO {schema}.daily_bars
                 (instrument_id, trade_date, open, high, low, close, adj_close, volume, source_table, updated_at)
-            SELECT
+            SELECT DISTINCT ON (i.instrument_id, s.trade_date)
                 i.instrument_id,
                 s.trade_date,
                 s.open,
@@ -388,6 +411,7 @@ def upsert_bars(conn: psycopg.Connection, schema: str) -> None:
               ON i.symbol = s.symbol
             WHERE s.symbol IS NOT NULL
               AND s.trade_date IS NOT NULL
+            ORDER BY i.instrument_id, s.trade_date
             ON CONFLICT (instrument_id, trade_date) DO UPDATE
             SET
                 open = EXCLUDED.open,
@@ -470,18 +494,84 @@ def iter_bar_rows(csv_file: io.TextIOBase, default_source_table: str) -> Iterato
         )
 
 
-def download_zip_bytes(session: requests.Session, url: str, config: Config) -> bytes:
-    with request_with_retries(
-            session,
-            url,
-            max_attempts=config.download_retries,
-            timeout=(config.request_timeout_connect, config.request_timeout_read),
-    ) as resp:
-        data = resp.content
-        print(f"[debug] first 500 bytes: {data[:500]!r}")
-        print(f"[debug] size: {len(data):,} bytes")
-        return data
+def download_zip_bytes(
+        session: requests.Session,
+        url: str,
+        config: Config,
+        poll_seconds: int = 5,
+        max_wait_seconds: int = 300,
+) -> bytes:
+    """
+    Nasdaq bulk export flow:
+    1. GET exporter metadata CSV from the datatable URL with qopts.export=true
+    2. Poll until file.status == Fresh
+    3. Download the actual ZIP from file.link
+    """
+    deadline = time.time() + max_wait_seconds
+    last_status: str | None = None
 
+    while True:
+        with request_with_retries(
+                session,
+                url,
+                max_attempts=config.download_retries,
+                timeout=(config.request_timeout_connect, config.request_timeout_read),
+        ) as resp:
+            meta_bytes = resp.content
+
+        meta_text = meta_bytes.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(meta_text))
+        row = next(reader, None)
+
+        if row is None:
+            raise RuntimeError(
+                f"Nasdaq bulk export metadata was empty for URL: {url}"
+            )
+
+        file_link = (row.get("file.link") or "").strip()
+        file_status = (row.get("file.status") or "").strip()
+        last_status = file_status or last_status
+
+        print(
+            f"[debug] bulk export status={file_status!r} "
+            f"link_present={bool(file_link)}"
+        )
+
+        if file_status.lower() == "fresh":
+            if not file_link:
+                raise RuntimeError(
+                    f"Bulk export is Fresh but file.link is empty for URL: {url}"
+                )
+
+            with request_with_retries(
+                    session,
+                    file_link,
+                    max_attempts=config.download_retries,
+                    timeout=(config.request_timeout_connect, 600),
+            ) as resp:
+                data = resp.content
+
+            if data[:2] != b"PK":
+                raise RuntimeError(
+                    "Downloaded bulk file is not a ZIP. "
+                    f"First 200 bytes: {data[:200]!r}"
+                )
+
+            return data
+
+        if file_status.lower() in {"creating", "regenerating"}:
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for bulk export to become Fresh. "
+                    f"Last status={last_status!r}, url={url}"
+                )
+            time.sleep(poll_seconds)
+            continue
+
+        raise RuntimeError(
+            f"Unexpected Nasdaq bulk export status {file_status!r} for URL: {url}. "
+            f"Metadata row={row}"
+        )
 
 def ingest_tickers(session: requests.Session, conn: psycopg.Connection, config: Config) -> None:
     print("[info] downloading SHARADAR/TICKERS...")
@@ -495,7 +585,10 @@ def ingest_tickers(session: requests.Session, conn: psycopg.Connection, config: 
         ["symbol", "name", "exchange", "instrument_type", "source_table", "category", "is_active"],
         iter_ticker_rows(csv_file),
     )
+    if count == 0:
+        raise RuntimeError("Parsed zero ticker rows from SHARADAR/TICKERS export")
     print(f"[info] copied {count:,} ticker rows to staging")
+
     upsert_instruments(conn, config.schema)
     print("[ok] upserted instruments")
 
@@ -517,16 +610,23 @@ def ingest_bars_for_table(
         ["symbol", "trade_date", "open", "high", "low", "close", "adj_close", "volume", "source_table"],
         iter_bar_rows(csv_file, default_source_table=table),
     )
+    if count == 0:
+        raise RuntimeError(f"Parsed zero bar rows from {table} export")
     print(f"[info] copied {count:,} bar rows from {table} to staging")
+
     upsert_bars(conn, config.schema)
     print(f"[ok] upserted daily_bars from {table}")
-
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Sharadar data and store directly in Postgres")
     parser.add_argument("--api-key", default=os.getenv("NDL_API_KEY") or os.getenv("NASDAQ_DATA_LINK_API_KEY"))
     parser.add_argument("--db-dsn", default=os.getenv("DATABASE_URL") or os.getenv("PG_DSN"))
     parser.add_argument("--schema", default=os.getenv("DB_SCHEMA", "strategy_engine"))
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Truncate all existing data before ingesting. WARNING: This will delete all data!",
+    )
     parser.add_argument(
         "--tables",
         nargs="+",
@@ -550,6 +650,7 @@ def main(argv: Iterable[str]) -> int:
         api_key=args.api_key,
         db_dsn=args.db_dsn,
         schema=args.schema,
+        overwrite=args.overwrite,
     )
 
     session = requests.Session()
@@ -562,6 +663,9 @@ def main(argv: Iterable[str]) -> int:
 
     with psycopg.connect(config.db_dsn, autocommit=False) as conn:
         ensure_schema(conn, config.schema)
+
+        if config.overwrite:
+            truncate_tables(conn, config.schema)
 
         if "SHARADAR/TICKERS" in args.tables:
             ingest_tickers(session, conn, config)
