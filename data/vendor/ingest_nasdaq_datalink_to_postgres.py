@@ -25,13 +25,7 @@ if _ENV_FILE.exists():
 
 
 BASE_URL = "https://data.nasdaq.com/api/v3/datatables/{table}.csv"
-DEFAULT_TABLES = [
-    "SHARADAR/TICKERS",
-    "SHARADAR/SEP",
-    "SHARADAR/SFP",
-    # NOTE: SHARADAR/DAILY does not exist in Nasdaq Data Link.
-    # Use Yahoo Finance (load_history.py) or other vendors for daily OHLCV data.
-]
+DEFAULT_TABLES = ["SHARADAR/TICKERS", "SHARADAR/SEP", "SHARADAR/SFP"]
 
 
 @dataclass
@@ -652,7 +646,10 @@ def ingest_bars_for_table(
         table: str,
 ) -> None:
     # Validate that the table is supported for bar data ingestion
-    supported_bar_tables = {"SHARADAR/SEP", "SHARADAR/SFP", "SHARADAR/DAILY"}
+    supported_bar_tables = {
+        "SHARADAR/SEP",
+        "SHARADAR/SFP",
+    }
     if table not in supported_bar_tables:
         raise ValueError(
             f"Table {table!r} does not exist or is not supported for bar data ingestion. "
