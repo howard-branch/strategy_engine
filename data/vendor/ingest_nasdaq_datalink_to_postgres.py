@@ -29,7 +29,8 @@ DEFAULT_TABLES = [
     "SHARADAR/TICKERS",
     "SHARADAR/SEP",
     "SHARADAR/SFP",
-    "SHARADAR/DAILY",
+    # NOTE: SHARADAR/DAILY does not exist in Nasdaq Data Link.
+    # Use Yahoo Finance (load_history.py) or other vendors for daily OHLCV data.
 ]
 
 
@@ -644,9 +645,19 @@ def ingest_bars_for_table(
         config: Config,
         table: str,
 ) -> None:
+    # Validate that the table is supported for bar data ingestion
+    supported_tables = {"SHARADAR/SEP", "SHARADAR/SFP"}
+    if table not in supported_tables:
+        raise ValueError(
+            f"Table '{table}' does not exist or is not supported for bar data ingestion. "
+            f"Valid tables: {', '.join(sorted(supported_tables))}. "
+            f"For daily OHLCV data, use load_history.py (Yahoo Finance) or other data vendors."
+        )
+    
     print(f"[info] downloading {table}...")
     data = download_zip_bytes(session, build_export_url(table, config.api_key), config)
     csv_file = first_csv_from_response_bytes(data)
+
 
     create_staging_tables(conn)
     count = copy_rows(
@@ -656,7 +667,11 @@ def ingest_bars_for_table(
         iter_bar_rows(csv_file, default_source_table=table),
     )
     if count == 0:
-        raise RuntimeError(f"Parsed zero bar rows from {table} export")
+        raise RuntimeError(
+            f"Parsed zero bar rows from {table} export. "
+            f"This may indicate the data format has changed or the table is empty. "
+            f"Check that the CSV contains expected columns: ticker/symbol, date/trade_date, open, high, low, close, volume."
+        )
     print(f"[info] copied {count:,} bar rows from {table} to staging")
 
     upsert_bars(conn, config.schema)
