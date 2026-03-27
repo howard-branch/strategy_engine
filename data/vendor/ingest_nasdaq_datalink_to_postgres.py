@@ -25,7 +25,12 @@ if _ENV_FILE.exists():
 
 
 BASE_URL = "https://data.nasdaq.com/api/v3/datatables/{table}.csv"
-DEFAULT_TABLES = ["SHARADAR/TICKERS", "SHARADAR/SEP", "SHARADAR/SFP"]
+DEFAULT_TABLES = [
+    "SHARADAR/TICKERS",
+    "SHARADAR/SEP",
+    "SHARADAR/SFP",
+    "SHARADAR/DAILY",
+]
 
 
 @dataclass
