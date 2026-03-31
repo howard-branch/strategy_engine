@@ -190,7 +190,7 @@ def main() -> int:
         table_code=TABLE_CODE,
         required_cols=REQUIRED_TICKERS_COLS,
         known_cols=KNOWN_TICKERS_COLS,
-        date_filter_col="lastupdated",
+        date_filter_col=None,  # reference table → always full reload
         ensure_schema_fn=ensure_schema,
         get_max_date_fn=get_max_lastupdated,
         stage_and_upsert_fn=stage_and_upsert,
