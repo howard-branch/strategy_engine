@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import sys
 import time
 import zipfile
 from dataclasses import dataclass
@@ -14,26 +15,41 @@ import dotenv
 import psycopg
 import requests
 
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _PROJECT_ROOT / ".env"
 if _ENV_FILE.exists():
     dotenv.load_dotenv(_ENV_FILE)
+
+# Shared Sharadar helpers
+_VENDOR_DIR = Path(__file__).resolve().parent
+if str(_VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(_VENDOR_DIR))
+
+from sharadar_common import (
+    fetch_api_sample,
+    validate_sample_shape,
+    detect_schema_drift,
+)
+
+DATASET_CODE = "SHARADAR/INDICATORS"
+
+# Columns the API must return (rule 2c) and the full known set (rule 2b).
+REQUIRED_INDICATORS_COLS: set[str] = {"indicator", "table"}
+KNOWN_INDICATORS_COLS: set[str] = {
+    "indicator", "table", "name", "description", "unittype",
+}
 
 
 @dataclass
 class Config:
     api_key: str
     db_dsn: str
-    schema: str = "project_quant"
+    schema: str = "strategy_engine"
     batch_size: int = 10_000
     download_retries: int = 5
     request_timeout_connect: int = 30
     request_timeout_read: int = 600
     overwrite: bool = False
-
-
-DATASET_CODE = "SHARADAR/INDICATORS"
 
 
 def normalise_header(name: str) -> str:
@@ -80,7 +96,7 @@ def request_with_retries(
             last_exc = exc
             if attempt == max_attempts:
                 break
-            sleep_s = min(2**attempt, 30)
+            sleep_s = min(2 ** attempt, 30)
             print(f"[warn] request failed ({attempt}/{max_attempts}): {exc}")
             print(f"[info] retrying in {sleep_s}s...")
             time.sleep(sleep_s)
@@ -267,33 +283,55 @@ def upsert_indicators(conn: psycopg.Connection, schema: str) -> None:
         cur.execute(
             f"""
             INSERT INTO {schema}.sharadar_indicators (
-                table_name,
-                indicator,
-                name,
-                description,
-                unit_type,
-                raw_record,
-                updated_at
+                table_name, indicator, name, description, unit_type, raw_record, updated_at
             )
-            SELECT
-                s.table_name,
-                s.indicator,
-                s.name,
-                s.description,
-                s.unit_type,
-                s.raw_record,
-                NOW()
+            SELECT s.table_name, s.indicator, s.name, s.description, s.unit_type, s.raw_record, NOW()
             FROM stg_sharadar_indicators s
             WHERE s.indicator IS NOT NULL
             ON CONFLICT (table_name, indicator) DO UPDATE
-            SET
-                name = EXCLUDED.name,
+            SET name = EXCLUDED.name,
                 description = EXCLUDED.description,
                 unit_type = EXCLUDED.unit_type,
                 raw_record = EXCLUDED.raw_record,
                 updated_at = NOW()
             """
         )
+
+
+def _full_bulk_load(
+    session: requests.Session,
+    conn: psycopg.Connection,
+    config: Config,
+    *,
+    truncate: bool = False,
+) -> int:
+    """Download the full bulk CSV/ZIP and load into sharadar_indicators. Returns staged count."""
+    if truncate:
+        truncate_tables(conn, config.schema)
+
+    create_staging_tables(conn)
+
+    csv_file = download_csv_file(session, config)
+    total = 0
+
+    for batch in chunked(iter_indicator_rows(csv_file), config.batch_size):
+        copied = copy_rows(
+            conn,
+            "stg_sharadar_indicators",
+            ["table_name", "indicator", "name", "description", "unit_type", "raw_record"],
+            batch,
+        )
+        total += copied
+        print(f"[info] staged {copied:,} indicator rows (running total {total:,})")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM stg_sharadar_indicators")
+        staged_count = cur.fetchone()[0]
+    print(f"[info] staged sharadar indicator rows: {staged_count:,}")
+
+    upsert_indicators(conn, config.schema)
+    conn.commit()
+    return total
 
 
 def parse_args() -> Config:
@@ -303,7 +341,7 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Ingest SHARADAR/INDICATORS into Postgres")
     parser.add_argument("--api-key", default=os.getenv("NDL_API_KEY") or os.getenv("NASDAQ_DATA_LINK_API_KEY"))
     parser.add_argument("--db-dsn", default=os.getenv("DATABASE_URL") or os.getenv("DB_DSN"))
-    parser.add_argument("--schema", default=os.getenv("DB_SCHEMA", "project_quant"))
+    parser.add_argument("--schema", default=os.getenv("DB_SCHEMA", "strategy_engine"))
     parser.add_argument("--batch-size", type=int, default=10_000)
     parser.add_argument("--overwrite", action="store_true")
 
@@ -328,38 +366,35 @@ def main() -> int:
 
     with requests.Session() as session, psycopg.connect(config.db_dsn) as conn:
         ensure_schema(conn, config.schema)
-        if config.overwrite:
-            truncate_tables(conn, config.schema)
 
-        create_staging_tables(conn)
+        # ── STEP 1: sample validation (rule 2c) ───────────────────────────────
+        # INDICATORS is a small reference table with no date column, so we always
+        # do a full reload.  We still validate the sample shape first.
+        sample_cols, sample_rows = fetch_api_sample(
+            session, DATASET_CODE, config.api_key, n=75
+        )
+        validate_sample_shape(DATASET_CODE, sample_cols, sample_rows, REQUIRED_INDICATORS_COLS)
 
-        csv_file = download_csv_file(session, config)
-        total = 0
+        # ── STEP 2: schema-drift check (rule 2b) ──────────────────────────────
+        # If the API has changed columns, truncate first to avoid stale metadata.
+        drift = detect_schema_drift(DATASET_CODE, set(sample_cols), KNOWN_INDICATORS_COLS)
 
-        for batch in chunked(iter_indicator_rows(csv_file), config.batch_size):
-            copied = copy_rows(
-                conn,
-                "stg_sharadar_indicators",
-                ["table_name", "indicator", "name", "description", "unit_type", "raw_record"],
-                batch,
-            )
-            total += copied
-            print(f"[info] copied {copied:,} indicator rows to staging (running total {total:,})")
+        truncate = config.overwrite or drift
+        if drift:
+            print(f"[info] {DATASET_CODE}: schema drift detected – truncating before reload (rule 2b)")
+        elif config.overwrite:
+            print(f"[info] {DATASET_CODE}: --overwrite requested – truncating before reload")
+        else:
+            print(f"[info] {DATASET_CODE}: full reload (reference table, no incremental)")
 
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM stg_sharadar_indicators")
-            staged_count = cur.fetchone()[0]
-        print(f"[info] staged sharadar indicator rows: {staged_count:,}")
-
-        upsert_indicators(conn, config.schema)
-        conn.commit()
+        # INDICATORS has no date dimension → always do a full reload
+        total = _full_bulk_load(session, conn, config, truncate=truncate)
 
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {config.schema}.sharadar_indicators")
             final_count = cur.fetchone()[0]
 
-        print(f"[info] sharadar_indicators row count: {final_count:,}")
-
+    print(f"[info] {config.schema}.sharadar_indicators now contains {final_count:,} rows")
     return 0
 
 

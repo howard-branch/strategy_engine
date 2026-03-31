@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import sys
 import time
 import zipfile
 from dataclasses import dataclass
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -15,14 +17,32 @@ import dotenv
 import psycopg
 import requests
 
-
 # Load .env from project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _PROJECT_ROOT / ".env"
 if _ENV_FILE.exists():
     dotenv.load_dotenv(_ENV_FILE)
 
+# Shared Sharadar helpers
+_VENDOR_DIR = Path(__file__).resolve().parent
+if str(_VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(_VENDOR_DIR))
+
+from sharadar_common import (
+    fetch_api_sample,
+    validate_sample_shape,
+    detect_schema_drift,
+    fetch_incremental_rows,
+)
+
 BASE_URL = "https://data.nasdaq.com/api/v3/datatables/{table}.csv"
+TABLE_CODE = "SHARADAR/ACTIONS"
+
+# Columns the API must return (rule 2c) and the full known set (rule 2b).
+REQUIRED_ACTIONS_COLS: set[str] = {"ticker", "date", "action"}
+KNOWN_ACTIONS_COLS: set[str] = {
+    "ticker", "date", "action", "value", "contraticker", "contraname",
+}
 
 
 @dataclass
@@ -215,6 +235,14 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
     conn.commit()
 
 
+def get_max_action_date(conn: psycopg.Connection, schema: str) -> str | None:
+    """Return the most-recent action_date stored in the DB, or None if empty."""
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT MAX(action_date) FROM {schema}.corporate_actions")
+        result = cur.fetchone()[0]
+        return str(result) if result else None
+
+
 def create_staging_table(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS stg_actions")
@@ -248,6 +276,20 @@ def copy_rows(
     return total
 
 
+def _action_row_to_tuple(row: dict[str, str], default_source_table: str) -> tuple | None:
+    """Convert a normalised row dict to a staging tuple, or None if required fields missing."""
+    symbol = row_get(row, "ticker", "symbol")
+    action_date = row_get(row, "date", "action_date")
+    action = row_get(row, "action")
+    if not symbol or not action_date or not action:
+        return None
+    value = parse_decimal(row_get(row, "value"))
+    contra_ticker = row_get(row, "contraticker", "contra_ticker") or ""
+    contra_name = row_get(row, "contraname", "contra_name")
+    source_table = row_get(row, "table") or default_source_table
+    return (symbol, action_date, action, value, contra_ticker, contra_name, source_table)
+
+
 def iter_action_rows(
         csv_file: io.TextIOBase,
         default_source_table: str,
@@ -260,27 +302,20 @@ def iter_action_rows(
         if not printed:
             print(f"[debug] CSV columns: {reader.fieldnames}")
             printed = True
+        result = _action_row_to_tuple(row, default_source_table)
+        if result is not None:
+            yield result
 
-        symbol = row_get(row, "ticker", "symbol")
-        action_date = row_get(row, "date", "action_date")
-        action = row_get(row, "action")
-        value = parse_decimal(row_get(row, "value"))
-        contra_ticker = row_get(row, "contraticker", "contra_ticker") or ""
-        contra_name = row_get(row, "contraname", "contra_name")
-        source_table = row_get(row, "table") or default_source_table
 
-        if not symbol or not action_date or not action:
-            continue
-
-        yield (
-            symbol,
-            action_date,
-            action,
-            value,
-            contra_ticker,
-            contra_name,
-            source_table,
-        )
+def iter_action_rows_from_dicts(
+        rows: list[dict[str, str]],
+        default_source_table: str,
+) -> Iterator[tuple]:
+    """Variant of iter_action_rows for rows already loaded as dicts (incremental JSON path)."""
+    for row in rows:
+        result = _action_row_to_tuple(row, default_source_table)
+        if result is not None:
+            yield result
 
 
 def upsert_actions(conn: psycopg.Connection, schema: str) -> None:
@@ -334,30 +369,84 @@ def upsert_actions(conn: psycopg.Connection, schema: str) -> None:
         )
     conn.commit()
 
-def ingest_actions(session: requests.Session, conn: psycopg.Connection, config: Config) -> None:
-    table = "SHARADAR/ACTIONS"
-    print(f"[info] downloading {table}...")
 
-    data = download_zip_bytes(session, build_export_url(table, config.api_key), config)
-    csv_file = first_csv_from_response_bytes(data)
-
+def _stage_and_upsert(
+        conn: psycopg.Connection,
+        rows_iter: Iterator[tuple],
+        config: Config,
+) -> int:
+    """Stage *rows_iter* into stg_actions and upsert into corporate_actions."""
     create_staging_table(conn)
     count = copy_rows(
         conn,
         "stg_actions",
         ["symbol", "action_date", "action", "value", "contra_ticker", "contra_name", "source_table"],
-        iter_action_rows(csv_file, table),
+        rows_iter,
     )
+    if count == 0:
+        print(
+            "[warn] zero rows staged for SHARADAR/ACTIONS – "
+            "check column aliases in iter_action_rows"
+        )
+    else:
+        print(f"[info] staged {count:,} action rows")
+    upsert_actions(conn, config.schema)
+    return count
+
+
+def _full_bulk_load(
+        session: requests.Session,
+        conn: psycopg.Connection,
+        config: Config,
+        *,
+        truncate: bool = False,
+) -> None:
+    """Download the full bulk ZIP and load it into corporate_actions."""
+    if truncate:
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE {config.schema}.corporate_actions")
+        conn.commit()
+        print(f"[info] truncated {config.schema}.corporate_actions")
+
+    print(f"[info] downloading full bulk export for {TABLE_CODE}…")
+    data = download_zip_bytes(session, build_export_url(TABLE_CODE, config.api_key), config)
+    csv_file = first_csv_from_response_bytes(data)
+    try:
+        count = _stage_and_upsert(conn, iter_action_rows(csv_file, TABLE_CODE), config)
+    finally:
+        csv_file.close()
 
     if count == 0:
         raise RuntimeError(
             "Parsed zero corporate action rows from SHARADAR/ACTIONS export. "
             "Check the debug column list above and adjust iter_action_rows aliases if needed."
         )
+    print(f"[ok] full bulk load complete – {count:,} rows staged")
 
-    print(f"[info] copied {count:,} action rows to staging")
-    upsert_actions(conn, config.schema)
-    print("[ok] upserted corporate actions")
+
+def _do_incremental_load(
+        session: requests.Session,
+        conn: psycopg.Connection,
+        config: Config,
+        since_date: str,
+        until_date: str,
+) -> None:
+    """Fetch rows in the date window and upsert into corporate_actions."""
+    _cols, inc_rows = fetch_incremental_rows(
+        session,
+        TABLE_CODE,
+        config.api_key,
+        date_filter_col="date",
+        since_date=since_date,
+        until_date=until_date,
+    )
+    if not inc_rows:
+        print(f"[info] {TABLE_CODE}: no new/updated rows in window {since_date} → {until_date}")
+        return
+    count = _stage_and_upsert(
+        conn, iter_action_rows_from_dicts(inc_rows, TABLE_CODE), config
+    )
+    print(f"[info] incremental load complete – {count:,} rows staged")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -374,9 +463,14 @@ def main(argv: list[str]) -> int:
     db_dsn = dotenv.get_key(str(_ENV_FILE), "DATABASE_URL") if _ENV_FILE.exists() else None
 
     if not api_key:
-        raise RuntimeError("NDL_API_KEY not found in .env")
+        api_key = __import__("os").getenv("NDL_API_KEY")
     if not db_dsn:
-        raise RuntimeError("DATABASE_URL not found in .env")
+        db_dsn = __import__("os").getenv("DATABASE_URL")
+
+    if not api_key:
+        raise RuntimeError("NDL_API_KEY not found in .env or environment")
+    if not db_dsn:
+        raise RuntimeError("DATABASE_URL not found in .env or environment")
 
     config = Config(
         api_key=api_key,
@@ -390,8 +484,49 @@ def main(argv: list[str]) -> int:
 
     with psycopg.connect(config.db_dsn) as conn:
         ensure_schema(conn, config.schema)
-        ingest_actions(session, conn, config)
 
+        # ── STEP 1: sample validation (rule 2c) ───────────────────────────────
+        sample_cols, sample_rows = fetch_api_sample(
+            session, TABLE_CODE, config.api_key, n=75
+        )
+        validate_sample_shape(TABLE_CODE, sample_cols, sample_rows, REQUIRED_ACTIONS_COLS)
+
+        # ── STEP 2: schema-drift check (rule 2b) ──────────────────────────────
+        drift = detect_schema_drift(TABLE_CODE, set(sample_cols), KNOWN_ACTIONS_COLS)
+        max_date = get_max_action_date(conn, config.schema)
+
+        if config.overwrite or max_date is None:
+            reason = "--overwrite" if config.overwrite else "table is empty"
+            print(f"[info] {TABLE_CODE}: full bulk load ({reason})")
+            _full_bulk_load(session, conn, config, truncate=config.overwrite)
+
+        elif drift:
+            # Schema changed: truncate + full reload (rule 2b)
+            print(f"[info] {TABLE_CODE}: full bulk reload due to schema drift (rule 2b)")
+            _full_bulk_load(session, conn, config, truncate=True)
+
+        else:
+            # ── STEP 3: incremental load (rule 2a) ────────────────────────────
+            # Window: (max_date - 1 day) → yesterday.
+            # The -1 day overlap ensures the latest previously-loaded day is
+            # always refreshed, as today's data is unreliable.
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            since_date = (
+                date.fromisoformat(max_date) - timedelta(days=1)
+            ).isoformat()
+            print(
+                f"[info] {TABLE_CODE}: incremental load – "
+                f"DB max action_date: {max_date}, window: {since_date} → {yesterday}"
+            )
+            _do_incremental_load(session, conn, config, since_date, yesterday)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {config.schema}.corporate_actions"
+            )
+            total = cur.fetchone()[0]
+
+    print(f"[info] {config.schema}.corporate_actions now contains {total:,} rows")
     return 0
 
 

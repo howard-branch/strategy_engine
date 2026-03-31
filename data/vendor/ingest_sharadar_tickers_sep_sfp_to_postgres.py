@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""
+DEPRECATED – This combined ingest script is superseded by three separate files
+that each follow the shared Sharadar validation/incremental protocol:
+
+  • ingest_sharadar_tickers_to_postgres.py   (SHARADAR/TICKERS → instruments)
+  • ingest_sharadar_sep_to_postgres.py       (SHARADAR/SEP     → daily_bars)
+  • ingest_sharadar_sfp_to_postgres.py       (SHARADAR/SFP     → daily_bars)
+
+Each new file:
+  1. Downloads a 75-row sample and validates column shape (rule 2c: exit on mismatch)
+  2. Detects schema drift and truncates + reloads when columns change (rule 2b)
+  3. Does incremental download (max_date − 1 day → yesterday) otherwise (rule 2a)
+  4. Never ingests today's data (unreliable)
+
+This file is kept for reference only.  Do not use it for new ingestion runs.
+"""
 from __future__ import annotations
 
 import argparse
