@@ -1,0 +1,88 @@
+-- Migration: 2026-03-31
+-- SHARADAR/DAILY API schema change
+--
+-- Nasdaq trimmed the SHARADAR/DAILY endpoint to valuation-only metrics.
+-- The following columns are no longer provided by the API:
+--   pe1, ps1, price, volume,
+--   ebitda, ebitdamargin, ebit,
+--   grossmargin, netmargin, ros, roic, roe, roa,
+--   eps, epsdil, epsusd, epsdilgrowth1yr, fcfps, sps, tbvps, dps,
+--   revenue, revenueusd, gp, opex, opinc, sgna, rnd,
+--   netinc, netinccomstock, netincnci,
+--   assetturnover, commonequity, debt, intangibles,
+--   investedcapital, inventory, payables, receivables,
+--   retearn, tangibles, taxassets, taxliabilities, workingcapital,
+--   fcf, ncf, ncfbus, ncfcommon, ncfdebt, ncfdiv,
+--   ncff, ncfi, ncfinv, ncfo, ncfx,
+--   sharefactor, sharesbas, shareswa, shareswadil
+--
+-- Remaining API columns:
+--   ticker, date, lastupdated, ev, evebit, evebitda, marketcap, pb, pe, ps
+--
+-- The old columns are kept in the table so historical data is preserved.
+-- New rows will have NULLs for the dropped columns.
+-- No destructive DDL is required.
+--
+-- If you want to reclaim space, uncomment the ALTER TABLE below:
+
+-- ALTER TABLE strategy_engine.sharadar_daily
+--     DROP COLUMN IF EXISTS pe1,
+--     DROP COLUMN IF EXISTS ps1,
+--     DROP COLUMN IF EXISTS price,
+--     DROP COLUMN IF EXISTS volume,
+--     DROP COLUMN IF EXISTS ebitda,
+--     DROP COLUMN IF EXISTS ebitdamargin,
+--     DROP COLUMN IF EXISTS ebit,
+--     DROP COLUMN IF EXISTS grossmargin,
+--     DROP COLUMN IF EXISTS netmargin,
+--     DROP COLUMN IF EXISTS ros,
+--     DROP COLUMN IF EXISTS roic,
+--     DROP COLUMN IF EXISTS roe,
+--     DROP COLUMN IF EXISTS roa,
+--     DROP COLUMN IF EXISTS eps,
+--     DROP COLUMN IF EXISTS epsdil,
+--     DROP COLUMN IF EXISTS epsusd,
+--     DROP COLUMN IF EXISTS epsdilgrowth1yr,
+--     DROP COLUMN IF EXISTS fcfps,
+--     DROP COLUMN IF EXISTS sps,
+--     DROP COLUMN IF EXISTS tbvps,
+--     DROP COLUMN IF EXISTS dps,
+--     DROP COLUMN IF EXISTS revenue,
+--     DROP COLUMN IF EXISTS revenueusd,
+--     DROP COLUMN IF EXISTS gp,
+--     DROP COLUMN IF EXISTS opex,
+--     DROP COLUMN IF EXISTS opinc,
+--     DROP COLUMN IF EXISTS sgna,
+--     DROP COLUMN IF EXISTS rnd,
+--     DROP COLUMN IF EXISTS netinc,
+--     DROP COLUMN IF EXISTS netinccomstock,
+--     DROP COLUMN IF EXISTS netincnci,
+--     DROP COLUMN IF EXISTS assetturnover,
+--     DROP COLUMN IF EXISTS commonequity,
+--     DROP COLUMN IF EXISTS debt,
+--     DROP COLUMN IF EXISTS intangibles,
+--     DROP COLUMN IF EXISTS investedcapital,
+--     DROP COLUMN IF EXISTS inventory,
+--     DROP COLUMN IF EXISTS payables,
+--     DROP COLUMN IF EXISTS receivables,
+--     DROP COLUMN IF EXISTS retearn,
+--     DROP COLUMN IF EXISTS tangibles,
+--     DROP COLUMN IF EXISTS taxassets,
+--     DROP COLUMN IF EXISTS taxliabilities,
+--     DROP COLUMN IF EXISTS workingcapital,
+--     DROP COLUMN IF EXISTS fcf,
+--     DROP COLUMN IF EXISTS ncf,
+--     DROP COLUMN IF EXISTS ncfbus,
+--     DROP COLUMN IF EXISTS ncfcommon,
+--     DROP COLUMN IF EXISTS ncfdebt,
+--     DROP COLUMN IF EXISTS ncfdiv,
+--     DROP COLUMN IF EXISTS ncff,
+--     DROP COLUMN IF EXISTS ncfi,
+--     DROP COLUMN IF EXISTS ncfinv,
+--     DROP COLUMN IF EXISTS ncfo,
+--     DROP COLUMN IF EXISTS ncfx,
+--     DROP COLUMN IF EXISTS sharefactor,
+--     DROP COLUMN IF EXISTS sharesbas,
+--     DROP COLUMN IF EXISTS shareswa,
+--     DROP COLUMN IF EXISTS shareswadil;
+

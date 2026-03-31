@@ -28,11 +28,11 @@ from sharadar_common import (
 TABLE_CODE = "SHARADAR/ACTIONS"
 REQUIRED_ACTIONS_COLS: set[str] = {"ticker", "date", "action"}
 KNOWN_ACTIONS_COLS: set[str] = {
-    "ticker", "date", "action", "value", "contraticker", "contraname",
+    "ticker", "date", "action", "name", "value", "contraticker", "contraname",
 }
 
 _STAGING_COLUMNS = [
-    "symbol", "action_date", "action", "value",
+    "symbol", "action_date", "action", "name", "value",
     "contra_ticker", "contra_name", "source_table",
 ]
 
@@ -49,6 +49,7 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
                     REFERENCES {schema}.instruments(instrument_id),
                 action_date DATE NOT NULL,
                 action TEXT NOT NULL,
+                name TEXT,
                 value NUMERIC(30, 10),
                 contra_ticker TEXT NOT NULL DEFAULT '',
                 contra_name TEXT,
@@ -89,6 +90,7 @@ def _action_row_to_tuple(row: dict[str, str]) -> tuple | None:
         symbol,
         action_date,
         action,
+        row_get(row, "name"),
         parse_decimal(row_get(row, "value")),
         row_get(row, "contraticker", "contra_ticker") or "",
         row_get(row, "contraname", "contra_name"),
@@ -129,7 +131,7 @@ def stage_and_upsert(
             """
             CREATE TEMP TABLE stg_actions (
                 symbol TEXT, action_date DATE, action TEXT,
-                value NUMERIC(30, 10), contra_ticker TEXT,
+                name TEXT, value NUMERIC(30, 10), contra_ticker TEXT,
                 contra_name TEXT, source_table TEXT
             ) ON COMMIT DROP
             """
@@ -143,14 +145,14 @@ def stage_and_upsert(
         cur.execute(
             f"""
             INSERT INTO {config.schema}.corporate_actions (
-                instrument_id, action_date, action, value,
+                instrument_id, action_date, action, name, value,
                 contra_ticker, contra_name, source_table, updated_at
             )
             SELECT DISTINCT ON (
                 i.instrument_id, s.action_date, s.action,
                 COALESCE(s.contra_ticker, '')
             )
-                i.instrument_id, s.action_date, s.action, s.value,
+                i.instrument_id, s.action_date, s.action, s.name, s.value,
                 COALESCE(s.contra_ticker, ''), s.contra_name,
                 s.source_table, NOW()
             FROM stg_actions s
@@ -163,6 +165,7 @@ def stage_and_upsert(
                 s.value DESC NULLS LAST, s.contra_name DESC NULLS LAST
             ON CONFLICT (instrument_id, action_date, action, contra_ticker)
             DO UPDATE SET
+                name         = EXCLUDED.name,
                 value        = EXCLUDED.value,
                 contra_name  = EXCLUDED.contra_name,
                 source_table = EXCLUDED.source_table,

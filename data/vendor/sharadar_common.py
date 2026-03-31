@@ -663,6 +663,20 @@ def run_ingest(
                 since = (
                     date.fromisoformat(max_date) - timedelta(days=1)
                 ).isoformat()
+
+                if since > yesterday:
+                    print(
+                        f"[info] {table_code}: DB max date ({max_date}) "
+                        f"is already beyond yesterday ({yesterday}) – "
+                        f"nothing to fetch"
+                    )
+                    total = count_fn(conn, config.schema)
+                    print(
+                        f"[info] {table_code}: target table now "
+                        f"contains {total:,} rows"
+                    )
+                    return 0
+
                 print(
                     f"[info] {table_code}: incremental load – "
                     f"DB max date: {max_date}, "

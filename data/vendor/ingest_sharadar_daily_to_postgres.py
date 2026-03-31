@@ -20,7 +20,6 @@ from sharadar_common import (
     normalise_header,
     parse_decimal,
     parse_ingest_args,
-    parse_int,
     resolve_credentials,
     row_get,
     run_ingest,
@@ -28,43 +27,20 @@ from sharadar_common import (
 
 TABLE_CODE = "SHARADAR/DAILY"
 REQUIRED_DAILY_COLS: set[str] = {"ticker", "date", "lastupdated"}
+# Updated 2026-03-31 – Nasdaq trimmed SHARADAR/DAILY to valuation-only
+# metrics.  Income-statement, balance-sheet, cash-flow, and per-share
+# columns were removed (they remain available in SHARADAR/SF1).
+# Price/volume data remains available in SHARADAR/SEP.
 KNOWN_DAILY_COLS: set[str] = {
     "ticker", "date", "lastupdated",
     "ev", "evebit", "evebitda", "marketcap",
-    "pb", "pe", "pe1", "ps", "ps1",
-    "assetturnover", "commonequity", "debt", "dps",
-    "ebitda", "ebitdamargin", "ebit",
-    "eps", "epsdil", "epsusd", "epsdilgrowth1yr",
-    "fcf", "fcfps", "gp", "grossmargin",
-    "intangibles", "investedcapital", "inventory",
-    "ncf", "ncfbus", "ncfcommon", "ncfdebt", "ncfdiv", "ncff", "ncfi", "ncfinv", "ncfo", "ncfx",
-    "netinc", "netinccomstock", "netincnci", "netmargin",
-    "opex", "opinc",
-    "payables", "receivables", "retearn",
-    "revenue", "revenueusd", "rnd",
-    "ros", "roic", "roe", "roa",
-    "sgna", "sharefactor", "sharesbas", "shareswa", "shareswadil",
-    "sps", "tangibles", "taxassets", "taxliabilities",
-    "tbvps", "workingcapital",
-    "price", "volume",
+    "pb", "pe", "ps",
 }
 
 # Column order used for staging + COPY
 _METRIC_COLS = [
     "ev", "evebit", "evebitda", "marketcap",
-    "pb", "pe", "pe1", "ps", "ps1",
-    "price", "volume",
-    "ebitda", "ebitdamargin", "ebit",
-    "grossmargin", "netmargin", "ros", "roic", "roe", "roa",
-    "eps", "epsdil", "epsusd", "epsdilgrowth1yr", "fcfps", "sps", "tbvps", "dps",
-    "revenue", "revenueusd", "gp", "opex", "opinc", "sgna", "rnd",
-    "netinc", "netinccomstock", "netincnci",
-    "assetturnover", "commonequity", "debt", "intangibles",
-    "investedcapital", "inventory", "payables", "receivables",
-    "retearn", "tangibles", "taxassets", "taxliabilities", "workingcapital",
-    "fcf", "ncf", "ncfbus", "ncfcommon", "ncfdebt", "ncfdiv",
-    "ncff", "ncfi", "ncfinv", "ncfo", "ncfx",
-    "sharefactor", "sharesbas", "shareswa", "shareswadil",
+    "pb", "pe", "ps",
 ]
 
 _STAGING_COLUMNS = ["symbol", "trade_date", "last_updated"] + _METRIC_COLS
@@ -76,7 +52,7 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
     ensure_instruments_table(conn, schema)
     with conn.cursor() as cur:
         cols_ddl = ",\n                ".join(
-            f"{c} {'BIGINT' if c == 'volume' else 'NUMERIC'}" for c in _METRIC_COLS
+            f"{c} NUMERIC" for c in _METRIC_COLS
         )
         cur.execute(
             f"""
@@ -119,13 +95,7 @@ def _parse_daily_row(row: dict[str, str]) -> Optional[tuple]:
     if not symbol or not trade_date:
         return None
     last_updated = row_get(row, "lastupdated", "last_updated")
-    metrics = []
-    for c in _METRIC_COLS:
-        val = row_get(row, c)
-        if c == "volume":
-            metrics.append(parse_int(val))
-        else:
-            metrics.append(parse_decimal(val))
+    metrics = [parse_decimal(row_get(row, c)) for c in _METRIC_COLS]
     return (symbol, trade_date, last_updated, *metrics)
 
 
@@ -157,7 +127,7 @@ def stage_and_upsert(
     config: IngestConfig,
 ) -> int:
     stg_cols_ddl = ",\n                ".join(
-        f"{c} {'BIGINT' if c == 'volume' else 'NUMERIC'}" for c in _METRIC_COLS
+        f"{c} NUMERIC" for c in _METRIC_COLS
     )
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS stg_sharadar_daily")

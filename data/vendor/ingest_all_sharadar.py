@@ -25,21 +25,19 @@ _VENDOR_DIR = Path(__file__).resolve().parent
 #   1. Reference / metadata tables (no date filter, always full reload)
 #   2. Time-series data tables
 _SCRIPTS: list[tuple[str, list[str]]] = [
-    # ── reference tables ──────────────────────────────────────────
-    ("SHARADAR/TICKERS",    ["ingest_sharadar_tickers_to_postgres.py"]),
-    ("SHARADAR/INDICATORS", ["ingest_sharadar_indicators_to_postgres.py"]),
-    # ── event / action tables ─────────────────────────────────────
+    # ── incremental loads (time-series data) ──────────────────────
     ("SHARADAR/ACTIONS",    ["ingest_sharadar_actions_to_postgres.py"]),
-    ("SHARADAR/EVENTS",     ["ingest_sharadar_events_to_postgres.py"]),
-    ("SHARADAR/SP500",      ["ingest_sharadar_sp500_to_postgres.py"]),
-    # ── price tables ──────────────────────────────────────────────
     ("SHARADAR/DAILY",      ["ingest_sharadar_daily_to_postgres.py"]),
     ("SHARADAR/SEP",        ["ingest_sharadar_prices_to_postgres.py", "--table", "SHARADAR/SEP"]),
     ("SHARADAR/SFP",        ["ingest_sharadar_prices_to_postgres.py", "--table", "SHARADAR/SFP"]),
-    # ── fundamental tables ────────────────────────────────────────
     ("SHARADAR/SF1",        ["ingest_sharadar_sf1_to_postgres.py"]),
     ("SHARADAR/SF2",        ["ingest_sharadar_sf2_to_postgres.py"]),
     ("SHARADAR/SF3",        ["ingest_sharadar_sf3_to_postgres.py"]),
+    # ── non-incremental loads (full reload every run) ─────────────
+    ("SHARADAR/TICKERS",    ["ingest_sharadar_tickers_to_postgres.py"]),
+    ("SHARADAR/INDICATORS", ["ingest_sharadar_indicators_to_postgres.py"]),
+    ("SHARADAR/SP500",      ["ingest_sharadar_sp500_to_postgres.py"]),
+    ("SHARADAR/EVENTS",     ["ingest_sharadar_events_to_postgres.py"]),
 ]
 
 

@@ -26,10 +26,10 @@ from sharadar_common import (
 
 TABLE_CODE = "SHARADAR/EVENTS"
 REQUIRED_EVENTS_COLS: set[str] = {"ticker", "date", "eventcodes"}
-KNOWN_EVENTS_COLS: set[str] = {"ticker", "date", "eventcodes", "lastupdated"}
+KNOWN_EVENTS_COLS: set[str] = {"ticker", "date", "eventcodes"}
 
 _STAGING_COLUMNS = [
-    "symbol", "event_date", "event_code", "source_table", "last_updated",
+    "symbol", "event_date", "event_code", "source_table",
 ]
 
 
@@ -98,11 +98,10 @@ def _event_rows_from_row(row: dict[str, str]) -> Iterator[tuple]:
     event_date = row_get(row, "date", "event_date")
     event_codes = _parse_event_codes(row_get(row, "eventcodes", "eventcode"))
     source_table = row_get(row, "table") or "EVENTS"
-    last_updated = row_get(row, "lastupdated", "last_updated")
     if not symbol or not event_date or not event_codes:
         return
     for code in event_codes:
-        yield (symbol, event_date, code, source_table, last_updated)
+        yield (symbol, event_date, code, source_table)
 
 
 def iter_rows_csv(csv_file: io.TextIOBase) -> Iterator[tuple]:
@@ -134,7 +133,7 @@ def stage_and_upsert(
             """
             CREATE TEMP TABLE stg_sharadar_events (
                 symbol TEXT, event_date DATE, event_code INTEGER,
-                source_table TEXT, last_updated TIMESTAMPTZ
+                source_table TEXT
             ) ON COMMIT PRESERVE ROWS
             """
         )
@@ -166,17 +165,16 @@ def stage_and_upsert(
             f"""
             INSERT INTO {config.schema}.sharadar_events (
                 instrument_id, event_date, event_code,
-                source_table, last_updated, updated_at
+                source_table, updated_at
             )
             SELECT i.instrument_id, s.event_date, s.event_code,
-                   s.source_table, s.last_updated, NOW()
+                   s.source_table, NOW()
             FROM stg_sharadar_events s
             JOIN {config.schema}.instruments i ON i.symbol = s.symbol
             WHERE s.symbol IS NOT NULL
               AND s.event_date IS NOT NULL AND s.event_code IS NOT NULL
             ON CONFLICT (instrument_id, event_date, event_code) DO UPDATE SET
                 source_table = EXCLUDED.source_table,
-                last_updated = EXCLUDED.last_updated,
                 updated_at   = NOW()
             """
         )
@@ -211,7 +209,7 @@ def main() -> int:
         table_code=TABLE_CODE,
         required_cols=REQUIRED_EVENTS_COLS,
         known_cols=KNOWN_EVENTS_COLS,
-        date_filter_col="date",
+        date_filter_col=None,  # EVENTS API does not support date filtering → always full reload
         ensure_schema_fn=ensure_schema,
         get_max_date_fn=get_max_event_date,
         stage_and_upsert_fn=stage_and_upsert,

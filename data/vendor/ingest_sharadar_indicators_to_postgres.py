@@ -27,7 +27,8 @@ from sharadar_common import (
 TABLE_CODE = "SHARADAR/INDICATORS"
 REQUIRED_INDICATORS_COLS: set[str] = {"indicator", "table"}
 KNOWN_INDICATORS_COLS: set[str] = {
-    "indicator", "table", "name", "description", "unittype",
+    "indicator", "table", "title", "description", "unittype",
+    "isfilter", "isprimarykey",
 }
 
 _STAGING_COLUMNS = [
