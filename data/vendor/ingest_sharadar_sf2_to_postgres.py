@@ -255,26 +255,27 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
             ON {schema}.sharadar_sf2 (ticker)
             """
         )
-    cur.execute(
-        f"""
-    CREATE INDEX IF NOT EXISTS sharadar_sf2_transaction_date_idx
-    ON {schema}.sharadar_sf2 (transaction_date)
-    """
-    )
 
-    cur.execute(
-        f"""
-        CREATE INDEX IF NOT EXISTS sharadar_sf2_owner_name_idx
-        ON {schema}.sharadar_sf2 (owner_name)
-        """
-    )
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS sharadar_sf2_transaction_date_idx
+            ON {schema}.sharadar_sf2 (transaction_date)
+            """
+        )
 
-    cur.execute(
-        f"""
-        CREATE INDEX IF NOT EXISTS sharadar_sf2_transaction_code_idx
-        ON {schema}.sharadar_sf2 (transaction_code)
-        """
-    )
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS sharadar_sf2_owner_name_idx
+            ON {schema}.sharadar_sf2 (owner_name)
+            """
+        )
+
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS sharadar_sf2_transaction_code_idx
+            ON {schema}.sharadar_sf2 (transaction_code)
+            """
+        )
     conn.commit()
 
 
@@ -444,7 +445,7 @@ def upsert_sf2(conn: psycopg.Connection, schema: str) -> None:
                 raw_record,
                 updated_at
             )
-            SELECT
+            SELECT DISTINCT ON (s.ticker, s.filing_date, s.row_num)
                 s.ticker,
                 s.filing_date,
                 s.row_num,
@@ -475,6 +476,7 @@ def upsert_sf2(conn: psycopg.Connection, schema: str) -> None:
             WHERE s.ticker IS NOT NULL
               AND s.filing_date IS NOT NULL
               AND s.row_num IS NOT NULL
+            ORDER BY s.ticker, s.filing_date, s.row_num
             ON CONFLICT (ticker, filing_date, row_num) DO UPDATE
             SET
                 form_type = EXCLUDED.form_type,
@@ -547,7 +549,33 @@ def main() -> int:
             copied = copy_rows(
                 conn,
                 "stg_sharadar_sf2",
-                ["ticker", "filing_date", "raw_record"],
+                [
+                    "ticker",
+                    "filing_date",
+                    "row_num",
+                    "form_type",
+                    "issuer_name",
+                    "owner_name",
+                    "officer_title",
+                    "is_director",
+                    "is_officer",
+                    "is_ten_percent_owner",
+                    "transaction_date",
+                    "security_ad_code",
+                    "transaction_code",
+                    "shares_owned_before_transaction",
+                    "transaction_shares",
+                    "shares_owned_following_transaction",
+                    "transaction_price_per_share",
+                    "transaction_value",
+                    "security_title",
+                    "director_indirect",
+                    "nature_of_ownership",
+                    "date_exercisable",
+                    "price_exercisable",
+                    "expiration_date",
+                    "raw_record",
+                ],
                 batch,
             )
             total += copied
