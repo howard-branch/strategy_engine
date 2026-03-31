@@ -3,8 +3,8 @@ from signals import make_signal
 
 
 def main() -> None:
-    signal = make_signal("reversal")
-    run_experiment(signal, label="Reversal")
+    signal = make_signal("trend_following")
+    run_experiment(signal, label="Trend Following")
 
 
 if __name__ == "__main__":

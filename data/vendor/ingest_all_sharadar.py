@@ -38,6 +38,8 @@ _SCRIPTS: list[tuple[str, list[str]]] = [
     ("SHARADAR/INDICATORS", ["ingest_sharadar_indicators_to_postgres.py"]),
     ("SHARADAR/SP500",      ["ingest_sharadar_sp500_to_postgres.py"]),
     ("SHARADAR/EVENTS",     ["ingest_sharadar_events_to_postgres.py"]),
+    # ── external index data (Yahoo Finance) ───────────────────────
+    ("YAHOO/INDICES",       ["ingest_yahoo_indices_to_postgres.py"]),
 ]
 
 
