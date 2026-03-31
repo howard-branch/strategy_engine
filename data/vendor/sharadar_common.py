@@ -10,7 +10,9 @@ Every ingest script follows this sequence before loading data:
   2. ``validate_sample_shape()`` – assert required columns are present;
                                    if not → log full structure and raise SystemExit(1)  [rule 2c]
   3. ``detect_schema_drift()``   – compare API columns to the known column set;
-                                   if drift → truncate + full bulk reload              [rule 2b]
+                                   if the API has columns NOT in known_cols (data we'd
+                                   silently drop) OR known_cols has columns the API no
+                                   longer provides (shape changed) → SystemExit(1)     [rule 2b]
   4. If DB empty or --overwrite  → full bulk reload
   5. Otherwise                   → incremental load via ``fetch_incremental_rows()``   [rule 2a]
      (window: max_db_date - 1 day → yesterday, so latest day is always refreshed)
@@ -337,12 +339,21 @@ def detect_schema_drift(
     known_cols: set[str],
     *,
     ignore_cols: Optional[set[str]] = None,
-) -> bool:
+) -> None:
     """
-    Return ``True`` if *api_cols* differs from *known_cols* (after removing
-    *ignore_cols*).  Logs the diff when drift is found.
+    Validate that the columns returned by the API exactly match *known_cols*
+    (after removing *ignore_cols*).
 
-    Triggers rule 2b: caller should truncate + do a full bulk reload.
+    Raises ``SystemExit(1)`` if:
+
+    - The API returns columns **not** listed in *known_cols* — these would
+      be silently dropped during ingest, potentially losing meaningful data.
+    - *known_cols* lists columns the API **no longer provides** — the data
+      shape has changed and row parsing may break or produce NULLs.
+
+    A developer must update the ``KNOWN_*_COLS`` set in the ingest script to
+    match the current API schema.  If new columns contain meaningful data,
+    the DDL, row-parsing, and staging/upsert logic must be updated too.
     """
     if ignore_cols:
         api_cols = api_cols - ignore_cols
@@ -350,18 +361,34 @@ def detect_schema_drift(
 
     added = api_cols - known_cols
     removed = known_cols - api_cols
+
     if added or removed:
-        print(
-            f"[warn] {table_code}: schema drift detected → "
-            f"will truncate and do a full reload (rule 2b)"
-        )
+        print(f"\n{'=' * 60}")
+        print(f"  [FAIL] {table_code}: column schema mismatch – aborting")
+        print(f"{'=' * 60}")
         if added:
-            print(f"[warn]   new columns    : {sorted(added)}")
+            print(
+                f"\n  UNHANDLED columns (in API response, not in KNOWN_*_COLS):\n"
+                f"    {sorted(added)}\n"
+                f"  These columns would be silently dropped during ingest."
+            )
         if removed:
-            print(f"[warn]   removed columns: {sorted(removed)}")
-        return True
-    print(f"[info] {table_code}: schema unchanged ({len(api_cols)} data columns)")
-    return False
+            print(
+                f"\n  MISSING columns (in KNOWN_*_COLS, not in API response):\n"
+                f"    {sorted(removed)}\n"
+                f"  The API no longer provides these columns."
+            )
+        print(
+            f"\n  To fix: update the KNOWN_*_COLS set in the ingest script to\n"
+            f"  match the current API schema.  If new columns contain meaningful\n"
+            f"  data, also update DDL, row parsing, and staging/upsert logic.\n"
+        )
+        print(f"  API columns  : {sorted(api_cols)}")
+        print(f"  KNOWN_*_COLS : {sorted(known_cols)}")
+        print(f"{'=' * 60}\n")
+        raise SystemExit(1)
+
+    print(f"[info] {table_code}: column schema OK ({len(api_cols)} columns)")
 
 
 # ── Incremental download ──────────────────────────────────────────────────────
@@ -556,8 +583,8 @@ def run_ingest(
     Execute the standard Sharadar ingest protocol.
 
     Individual scripts provide dataset-specific callables; this function
-    handles the session, connection, validation, drift check, and
-    full-vs-incremental decision.
+    handles the session, connection, validation, column-coverage check,
+    and full-vs-incremental decision.
 
     Set *date_filter_col* to ``None`` for reference tables that always
     do a full reload (e.g. INDICATORS).
@@ -569,6 +596,7 @@ def run_ingest(
         ensure_schema_fn(conn, config.schema)
 
         # ── STEP 1: sample validation (rule 2c) ───────────────────────
+        #   Are the minimum required columns present?
         sample_cols, sample_rows = fetch_api_sample(
             session, table_code, config.api_key, n=75
         )
@@ -576,8 +604,11 @@ def run_ingest(
             table_code, sample_cols, sample_rows, required_cols
         )
 
-        # ── STEP 2: schema-drift check (rule 2b) ─────────────────────
-        drift = detect_schema_drift(
+        # ── STEP 2: column-coverage validation (rule 2b) ─────────────
+        #   Raises SystemExit(1) if the API returns columns we don't
+        #   know about (data would be silently dropped) or is missing
+        #   columns we expect (data shape has changed).
+        detect_schema_drift(
             table_code, set(sample_cols), known_cols
         )
 
@@ -601,13 +632,7 @@ def run_ingest(
 
         if date_filter_col is None:
             # Reference table: always full reload
-            truncate = config.overwrite or drift
-            if drift:
-                print(
-                    f"[info] {table_code}: schema drift detected – "
-                    f"truncating before reload (rule 2b)"
-                )
-            elif config.overwrite:
+            if config.overwrite:
                 print(
                     f"[info] {table_code}: --overwrite requested – "
                     f"truncating before reload"
@@ -617,7 +642,7 @@ def run_ingest(
                     f"[info] {table_code}: full reload "
                     f"(reference table, no incremental)"
                 )
-            _do_full_load(truncate=truncate)
+            _do_full_load(truncate=config.overwrite)
 
         else:
             max_date = get_max_date_fn(conn, config.schema)
@@ -629,12 +654,6 @@ def run_ingest(
                 print(f"[info] {table_code}: full bulk load ({reason})")
                 _do_full_load(truncate=config.overwrite)
 
-            elif drift:
-                print(
-                    f"[info] {table_code}: full bulk reload "
-                    f"due to schema drift (rule 2b)"
-                )
-                _do_full_load(truncate=True)
 
             else:
                 # ── STEP 3: incremental load (rule 2a) ────────────────

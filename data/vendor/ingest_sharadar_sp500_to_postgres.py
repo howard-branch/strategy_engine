@@ -205,7 +205,7 @@ def main() -> int:
         table_code=TABLE_CODE,
         required_cols=REQUIRED_SP500_COLS,
         known_cols=KNOWN_SP500_COLS,
-        date_filter_col="date",
+        date_filter_col=None,  # SP500 API does not support date filtering → always full reload
         ensure_schema_fn=ensure_schema,
         get_max_date_fn=get_max_membership_date,
         stage_and_upsert_fn=stage_and_upsert,

@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sharadar_common import (
     IngestConfig,
     copy_rows,
+    detect_schema_drift,
     ensure_instruments_table,
     fetch_api_sample,
     fetch_incremental_rows,
@@ -387,6 +388,41 @@ def main() -> int:
         )
         validate_sample_shape(TABLE_CODE, sample_cols, sample_rows, REQUIRED_SF1_COLS)
 
+        # STEP 2: column-coverage validation
+        #   SF1 stores all non-META columns in JSONB, so data fields are
+        #   never silently dropped.  We still need to verify that the META
+        #   structural columns haven't changed (they drive DB columns and
+        #   primary-key logic).
+        api_col_set = set(sample_cols)
+        api_data = api_col_set - META_KEYS   # data columns → go into JSONB
+
+        # Validate that all expected structural (META) columns are present.
+        meta_missing = META_KEYS - api_col_set
+        if meta_missing:
+            print(f"\n{'=' * 60}")
+            print(f"  [FAIL] {TABLE_CODE}: META column schema mismatch – aborting")
+            print(f"{'=' * 60}")
+            print(
+                f"\n  MISSING META columns (in META_KEYS, not in API):\n"
+                f"    {sorted(meta_missing)}\n"
+                f"  The API no longer provides these structural columns."
+            )
+            print(
+                f"\n  To fix: update META_KEYS in {Path(__file__).name} to\n"
+                f"  match the current API schema, and update DDL / row\n"
+                f"  parsing if structural columns changed.\n"
+            )
+            print(f"  API columns   : {sorted(api_col_set)}")
+            print(f"  expected META : {sorted(META_KEYS)}")
+            print(f"{'=' * 60}\n")
+            raise SystemExit(1)
+
+        print(
+            f"[info] {TABLE_CODE}: column schema OK – "
+            f"{len(META_KEYS)} META cols, {len(api_data)} data cols "
+            f"(data cols captured in JSONB)"
+        )
+
         max_lastupdated = get_max_lastupdated(conn, config.schema)
 
         # FULL BULK LOAD
@@ -407,12 +443,21 @@ def main() -> int:
                 if added or removed:
                     schema_ok = False
                     print(
-                        f"[warn] {TABLE_CODE}: field schema changed: "
-                        f"+{len(added)} new, -{len(removed)} removed → "
+                        f"[warn] {TABLE_CODE}: data-field schema changed → "
                         f"full bulk reload (rule 2b)"
                     )
+                    if added:
+                        print(
+                            f"[warn]   new data fields ({len(added)}): "
+                            f"{sorted(added)}"
+                        )
+                    if removed:
+                        print(
+                            f"[warn]   removed data fields ({len(removed)}): "
+                            f"{sorted(removed)}"
+                        )
                 else:
-                    print(f"[info] schema unchanged ({len(api_fields)} data fields)")
+                    print(f"[info] data-field schema unchanged ({len(api_fields)} fields)")
 
             if not schema_ok:
                 _full_bulk_load(session, conn, config, truncate=True)
