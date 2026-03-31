@@ -1,222 +1,49 @@
 #!/usr/bin/env python3
+"""Ingest SHARADAR/SF3 (institutional holdings) into Postgres."""
 from __future__ import annotations
 
 import csv
 import io
 import json
 import sys
-import time
-import zipfile
-from dataclasses import dataclass
-from datetime import date, timedelta
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterator
 
-import dotenv
 import psycopg
-import requests
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_ENV_FILE = _PROJECT_ROOT / ".env"
-if _ENV_FILE.exists():
-    dotenv.load_dotenv(_ENV_FILE)
-
-# Shared Sharadar helpers
-_VENDOR_DIR = Path(__file__).resolve().parent
-if str(_VENDOR_DIR) not in sys.path:
-    sys.path.insert(0, str(_VENDOR_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sharadar_common import (
-    fetch_api_sample,
-    validate_sample_shape,
-    detect_schema_drift,
-    fetch_incremental_rows,
+    IngestConfig,
+    chunked,
+    copy_rows,
+    ensure_instruments_table,
+    normalise_header,
+    parse_ingest_args,
+    parse_numeric,
+    resolve_credentials,
+    row_get,
+    run_ingest,
 )
 
-DATASET_CODE = "SHARADAR/SF3"
-
-# Columns the API must return (rule 2c) and the full known set (rule 2b).
+TABLE_CODE = "SHARADAR/SF3"
 REQUIRED_SF3_COLS: set[str] = {"ticker", "investorname", "securitytype", "calendardate"}
 KNOWN_SF3_COLS: set[str] = {
-    "ticker", "investorname", "securitytype", "calendardate", "value", "units", "price",
+    "ticker", "investorname", "securitytype", "calendardate",
+    "value", "units", "price",
 }
 
-
-@dataclass
-class Config:
-    api_key: str
-    db_dsn: str
-    schema: str = "strategy_engine"
-    batch_size: int = 100_000
-    download_retries: int = 5
-    request_timeout_connect: int = 30
-    request_timeout_read: int = 600
-    overwrite: bool = False
+_STAGING_COLUMNS = [
+    "ticker", "investor_name", "security_type", "calendar_date",
+    "value", "units", "price", "raw_record",
+]
 
 
-def normalise_header(name: str) -> str:
-    return name.strip().lower().replace(" ", "_")
-
-
-def row_get(row: dict[str, str], *names: str) -> Optional[str]:
-    for name in names:
-        key = normalise_header(name)
-        if key in row:
-            value = row[key]
-            if value is None:
-                return None
-            value = value.strip()
-            return value if value != "" else None
-    return None
-
-
-def parse_int(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(float(value))
-    except ValueError:
-        return None
-
-
-def parse_numeric(value: Optional[str]):
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def chunked(rows: Iterable[tuple], size: int) -> Iterator[list[tuple]]:
-    buf: list[tuple] = []
-    for row in rows:
-        buf.append(row)
-        if len(buf) >= size:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
-
-
-def request_with_retries(
-    session: requests.Session,
-    url: str,
-    *,
-    max_attempts: int,
-    timeout: tuple[int, int],
-) -> requests.Response:
-    last_exc: Exception | None = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-            resp.raise_for_status()
-            return resp
-        except Exception as exc:
-            last_exc = exc
-            if attempt == max_attempts:
-                break
-            sleep_s = min(2 ** attempt, 30)
-            print(f"[warn] request failed ({attempt}/{max_attempts}): {exc}")
-            print(f"[info] retrying in {sleep_s}s...")
-            time.sleep(sleep_s)
-    assert last_exc is not None
-    raise last_exc
-
-
-def get_bulk_export_link(
-    session: requests.Session,
-    datatable_code: str,
-    api_key: str,
-    *,
-    poll_seconds: int = 5,
-    max_wait_seconds: int = 300,
-) -> str:
-    url = (
-        f"https://data.nasdaq.com/api/v3/datatables/{datatable_code}.csv"
-        f"?qopts.export=true&api_key={api_key}"
-    )
-    deadline = time.time() + max_wait_seconds
-
-    while True:
-        resp = session.get(url, timeout=(30, 300))
-        resp.raise_for_status()
-
-        reader = csv.DictReader(io.StringIO(resp.text))
-        row = next(reader, None)
-        if row is None:
-            raise RuntimeError(f"No metadata row returned for bulk export {datatable_code}")
-
-        link = (row.get("file.link") or "").strip()
-        status = (row.get("file.status") or "").strip()
-
-        print(f"[debug] bulk export {datatable_code}: status={status!r}, link_present={bool(link)}")
-
-        if status.lower() == "fresh":
-            if not link:
-                raise RuntimeError(f"Bulk export {datatable_code} is Fresh but file.link is empty")
-            return link
-
-        if status.lower() in {"creating", "regenerating"}:
-            if time.time() >= deadline:
-                raise TimeoutError(f"Timed out waiting for Nasdaq export {datatable_code} to become Fresh")
-            time.sleep(poll_seconds)
-            continue
-
-        raise RuntimeError(f"Unexpected bulk export status for {datatable_code}: {status!r}; row={row}")
-
-
-def first_csv_from_bytes(data: bytes) -> io.TextIOBase:
-    if zipfile.is_zipfile(io.BytesIO(data)):
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            csv_names = [name for name in zf.namelist() if name.lower().endswith(".csv")]
-            if not csv_names:
-                raise RuntimeError(f"ZIP download contained no CSV files: {zf.namelist()}")
-            name = csv_names[0]
-            print(f"[debug] extracted CSV from ZIP: {name}")
-            return io.StringIO(zf.read(name).decode("utf-8", errors="replace"))
-
-    text = data.decode("utf-8", errors="replace")
-    if text.lstrip().startswith("{"):
-        raise RuntimeError(f"Nasdaq returned JSON instead of CSV: {text[:500]}")
-    if "<html" in text[:500].lower():
-        raise RuntimeError(f"Nasdaq returned HTML instead of CSV: {text[:500]}")
-    return io.StringIO(text)
-
-
-def download_csv_file(session: requests.Session, config: Config) -> io.TextIOBase:
-    link = get_bulk_export_link(session, DATASET_CODE, config.api_key)
-    resp = request_with_retries(
-        session,
-        link,
-        max_attempts=config.download_retries,
-        timeout=(config.request_timeout_connect, config.request_timeout_read),
-    )
-    return first_csv_from_bytes(resp.content)
-
+# ── Schema / DDL ─────────────────────────────────────────────────────────────
 
 def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
+    ensure_instruments_table(conn, schema)
     with conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {schema}.instruments (
-                instrument_id BIGSERIAL PRIMARY KEY,
-                symbol TEXT NOT NULL UNIQUE,
-                asset_type TEXT NOT NULL DEFAULT 'STOCK',
-                name TEXT,
-                exchange TEXT,
-                instrument_type TEXT,
-                source_table TEXT,
-                category TEXT,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {schema}.sharadar_sf3 (
@@ -234,69 +61,26 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
             )
             """
         )
-        cur.execute(
-            f"CREATE INDEX IF NOT EXISTS sharadar_sf3_calendar_date_idx ON {schema}.sharadar_sf3 (calendar_date)"
-        )
-        cur.execute(
-            f"CREATE INDEX IF NOT EXISTS sharadar_sf3_ticker_idx ON {schema}.sharadar_sf3 (ticker)"
-        )
-        cur.execute(
-            f"CREATE INDEX IF NOT EXISTS sharadar_sf3_investor_name_idx ON {schema}.sharadar_sf3 (investor_name)"
-        )
-        conn.commit()
+        for idx_col in ("calendar_date", "ticker", "investor_name"):
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS sharadar_sf3_{idx_col}_idx "
+                f"ON {schema}.sharadar_sf3 ({idx_col})"
+            )
+    conn.commit()
 
 
 def get_max_calendar_date(conn: psycopg.Connection, schema: str) -> str | None:
-    """Return the most-recent calendar_date stored in the DB, or None if empty."""
     with conn.cursor() as cur:
         cur.execute(f"SELECT MAX(calendar_date) FROM {schema}.sharadar_sf3")
         result = cur.fetchone()[0]
         return str(result) if result else None
 
 
-def create_staging_tables(conn: psycopg.Connection) -> None:
-    with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS stg_sharadar_sf3")
-        cur.execute(
-            """
-            CREATE TEMP TABLE stg_sharadar_sf3 (
-                ticker TEXT,
-                investor_name TEXT,
-                security_type TEXT,
-                calendar_date DATE,
-                value NUMERIC,
-                units NUMERIC,
-                price NUMERIC,
-                raw_record JSONB
-            ) ON COMMIT PRESERVE ROWS
-            """
-        )
-
-
-def copy_rows(
-    conn: psycopg.Connection,
-    table_name: str,
-    columns: list[str],
-    rows: Iterable[tuple],
-) -> int:
-    total = 0
-    with conn.cursor() as cur:
-        with cur.copy(f"COPY {table_name} ({', '.join(columns)}) FROM STDIN") as copy:
-            for row in rows:
-                copy.write_row(row)
-                total += 1
-    return total
-
-
-_SF3_STAGING_COLS = [
-    "ticker", "investor_name", "security_type", "calendar_date",
-    "value", "units", "price", "raw_record",
-]
-
+# ── Row parsing ──────────────────────────────────────────────────────────────
 
 def _sf3_row_to_tuple(row: dict[str, str]) -> tuple | None:
-    """Convert a normalised row dict to a staging tuple, or None if PK fields are missing."""
-    r = {normalise_header(k): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+    r = {normalise_header(k): (v.strip() if isinstance(v, str) else v)
+         for k, v in row.items()}
     ticker = row_get(r, "ticker", "symbol")
     investor_name = row_get(r, "investorname", "investor_name")
     security_type = row_get(r, "securitytype", "security_type")
@@ -312,7 +96,7 @@ def _sf3_row_to_tuple(row: dict[str, str]) -> tuple | None:
     )
 
 
-def iter_sf3_rows(csv_file: io.TextIOBase) -> Iterator[tuple]:
+def iter_rows_csv(csv_file: io.TextIOBase) -> Iterator[tuple]:
     reader = csv.DictReader(csv_file)
     reader.fieldnames = [normalise_header(x) for x in (reader.fieldnames or [])]
     debug_printed = False
@@ -325,191 +109,117 @@ def iter_sf3_rows(csv_file: io.TextIOBase) -> Iterator[tuple]:
             yield result
 
 
-def iter_sf3_rows_from_dicts(rows: list[dict[str, str]]) -> Iterator[tuple]:
-    """Variant of iter_sf3_rows for rows already loaded as dicts (incremental JSON path)."""
+def iter_rows_dicts(rows: list[dict[str, str]]) -> Iterator[tuple]:
     for row in rows:
         result = _sf3_row_to_tuple(row)
         if result is not None:
             yield result
 
 
-def upsert_instruments_from_sf3(conn: psycopg.Connection, schema: str) -> None:
+# ── Staging + upsert ─────────────────────────────────────────────────────────
+
+def stage_and_upsert(
+    conn: psycopg.Connection,
+    rows_iter: Iterator[tuple],
+    config: IngestConfig,
+) -> int:
     with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS stg_sharadar_sf3")
         cur.execute(
-            f"""
-            INSERT INTO {schema}.instruments (symbol, asset_type, source_table, is_active, updated_at)
-            SELECT DISTINCT s.ticker, 'STOCK', 'SF3', TRUE, NOW()
-            FROM stg_sharadar_sf3 s
-            WHERE s.ticker IS NOT NULL
-            ON CONFLICT (symbol) DO UPDATE
-            SET updated_at = NOW(),
-                source_table = COALESCE({schema}.instruments.source_table, EXCLUDED.source_table)
+            """
+            CREATE TEMP TABLE stg_sharadar_sf3 (
+                ticker TEXT, investor_name TEXT, security_type TEXT,
+                calendar_date DATE, value NUMERIC, units NUMERIC,
+                price NUMERIC, raw_record JSONB
+            ) ON COMMIT PRESERVE ROWS
             """
         )
+    total = 0
+    for batch in chunked(rows_iter, config.batch_size):
+        copied = copy_rows(conn, "stg_sharadar_sf3", _STAGING_COLUMNS, batch)
+        total += copied
+        print(f"[info] staged {copied:,} SF3 rows (running total {total:,})")
+    print(f"[info] staged sharadar SF3 rows: {total:,}")
 
-
-def upsert_sf3(conn: psycopg.Connection, schema: str) -> None:
     with conn.cursor() as cur:
+        # instruments
         cur.execute(
             f"""
-            INSERT INTO {schema}.sharadar_sf3 (
+            INSERT INTO {config.schema}.instruments
+                (symbol, asset_type, source_table, is_active, updated_at)
+            SELECT DISTINCT s.ticker, 'STOCK', 'SF3', TRUE, NOW()
+            FROM stg_sharadar_sf3 s WHERE s.ticker IS NOT NULL
+            ON CONFLICT (symbol) DO UPDATE
+            SET updated_at = NOW(),
+                source_table = COALESCE(
+                    {config.schema}.instruments.source_table,
+                    EXCLUDED.source_table
+                )
+            """
+        )
+        # sf3
+        cur.execute(
+            f"""
+            INSERT INTO {config.schema}.sharadar_sf3 (
                 ticker, investor_name, security_type, calendar_date,
                 value, units, price, raw_record, updated_at
             )
-            SELECT
-                s.ticker, s.investor_name, s.security_type, s.calendar_date,
-                s.value, s.units, s.price, s.raw_record, NOW()
+            SELECT s.ticker, s.investor_name, s.security_type,
+                   s.calendar_date, s.value, s.units, s.price,
+                   s.raw_record, NOW()
             FROM stg_sharadar_sf3 s
-            WHERE s.ticker IS NOT NULL
-              AND s.investor_name IS NOT NULL
-              AND s.security_type IS NOT NULL
-              AND s.calendar_date IS NOT NULL
-            ON CONFLICT (ticker, investor_name, security_type, calendar_date) DO UPDATE
-            SET value = EXCLUDED.value,
-                units = EXCLUDED.units,
-                price = EXCLUDED.price,
+            WHERE s.ticker IS NOT NULL AND s.investor_name IS NOT NULL
+              AND s.security_type IS NOT NULL AND s.calendar_date IS NOT NULL
+            ON CONFLICT (ticker, investor_name, security_type, calendar_date)
+            DO UPDATE SET
+                value      = EXCLUDED.value,
+                units      = EXCLUDED.units,
+                price      = EXCLUDED.price,
                 raw_record = EXCLUDED.raw_record,
                 updated_at = NOW()
             """
         )
-
-
-def _stage_and_upsert(
-    conn: psycopg.Connection,
-    rows_iter: Iterator[tuple],
-    config: Config,
-) -> int:
-    """Stage *rows_iter* and upsert into sharadar_sf3. Returns staged count."""
-    create_staging_tables(conn)
-    total = 0
-    for batch in chunked(rows_iter, config.batch_size):
-        copied = copy_rows(conn, "stg_sharadar_sf3", _SF3_STAGING_COLS, batch)
-        total += copied
-        print(f"[info] staged {copied:,} SF3 rows (running total {total:,})")
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM stg_sharadar_sf3")
-        staged_count = cur.fetchone()[0]
-    print(f"[info] staged sharadar SF3 rows: {staged_count:,}")
-
-    upsert_instruments_from_sf3(conn, config.schema)
-    upsert_sf3(conn, config.schema)
     conn.commit()
     return total
 
 
-def _full_bulk_load(
-    session: requests.Session,
-    conn: psycopg.Connection,
-    config: Config,
-    *,
-    truncate: bool = False,
-) -> None:
-    """Download the full bulk CSV/ZIP and load into sharadar_sf3."""
-    if truncate:
-        with conn.cursor() as cur:
-            cur.execute(f"TRUNCATE TABLE {config.schema}.sharadar_sf3")
-        conn.commit()
-        print(f"[info] truncated {config.schema}.sharadar_sf3")
-
-    print(f"[info] downloading full bulk export for {DATASET_CODE}…")
-    csv_file = download_csv_file(session, config)
-    count = _stage_and_upsert(conn, iter_sf3_rows(csv_file), config)
-    print(f"[ok] full bulk load complete – {count:,} SF3 rows staged")
+def truncate_target(conn: psycopg.Connection, schema: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE TABLE {schema}.sharadar_sf3")
+    conn.commit()
+    print(f"[info] truncated {schema}.sharadar_sf3")
 
 
-def _do_incremental_load(
-    session: requests.Session,
-    conn: psycopg.Connection,
-    config: Config,
-    since_date: str,
-    until_date: str,
-) -> None:
-    """Fetch rows in the calendar-date window and upsert into sharadar_sf3."""
-    _cols, inc_rows = fetch_incremental_rows(
-        session,
-        DATASET_CODE,
-        config.api_key,
-        date_filter_col="calendardate",
-        since_date=since_date,
-        until_date=until_date,
-    )
-    if not inc_rows:
-        print(f"[info] {DATASET_CODE}: no new/updated rows in window {since_date} → {until_date}")
-        return
-    count = _stage_and_upsert(conn, iter_sf3_rows_from_dicts(inc_rows), config)
-    print(f"[info] incremental load complete – {count:,} SF3 rows staged")
+def count_target(conn: psycopg.Connection, schema: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {schema}.sharadar_sf3")
+        return cur.fetchone()[0]
 
 
-def parse_args() -> Config:
-    import argparse
-    import os
-
-    parser = argparse.ArgumentParser(description="Ingest SHARADAR/SF3 into Postgres")
-    parser.add_argument("--api-key", default=os.getenv("NDL_API_KEY") or os.getenv("NASDAQ_DATA_LINK_API_KEY") or os.getenv("NASDAQ_API_KEY"))
-    parser.add_argument("--db-dsn", default=os.getenv("DATABASE_URL") or os.getenv("DB_DSN"))
-    parser.add_argument("--schema", default=os.getenv("DB_SCHEMA", "strategy_engine"))
-    parser.add_argument("--batch-size", type=int, default=100_000)
-    parser.add_argument("--overwrite", action="store_true", help="Truncate sharadar_sf3 before loading")
-
-    args = parser.parse_args()
-
-    if not args.api_key:
-        raise SystemExit("Missing --api-key (or NDL_API_KEY / NASDAQ_DATA_LINK_API_KEY / NASDAQ_API_KEY in environment)")
-    if not args.db_dsn:
-        raise SystemExit("Missing --db-dsn (or DATABASE_URL / DB_DSN in environment)")
-
-    return Config(
-        api_key=args.api_key,
-        db_dsn=args.db_dsn,
-        schema=args.schema,
-        batch_size=args.batch_size,
-        overwrite=args.overwrite,
-    )
-
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    config = parse_args()
-
-    with requests.Session() as session, psycopg.connect(config.db_dsn) as conn:
-        ensure_schema(conn, config.schema)
-
-        # ── STEP 1: sample validation (rule 2c) ───────────────────────────────
-        sample_cols, sample_rows = fetch_api_sample(
-            session, DATASET_CODE, config.api_key, n=75
-        )
-        validate_sample_shape(DATASET_CODE, sample_cols, sample_rows, REQUIRED_SF3_COLS)
-
-        # ── STEP 2: schema-drift check (rule 2b) ──────────────────────────────
-        drift = detect_schema_drift(DATASET_CODE, set(sample_cols), KNOWN_SF3_COLS)
-        max_date = get_max_calendar_date(conn, config.schema)
-
-        if config.overwrite or max_date is None:
-            reason = "--overwrite" if config.overwrite else "table is empty"
-            print(f"[info] {DATASET_CODE}: full bulk load ({reason})")
-            _full_bulk_load(session, conn, config, truncate=config.overwrite)
-
-        elif drift:
-            print(f"[info] {DATASET_CODE}: full bulk reload due to schema drift (rule 2b)")
-            _full_bulk_load(session, conn, config, truncate=True)
-
-        else:
-            # ── STEP 3: incremental load (rule 2a) ────────────────────────────
-            # Window: (max_date - 1 day) → yesterday, so latest day is refreshed.
-            yesterday = (date.today() - timedelta(days=1)).isoformat()
-            since_date = (date.fromisoformat(max_date) - timedelta(days=1)).isoformat()
-            print(
-                f"[info] {DATASET_CODE}: incremental load – "
-                f"DB max calendar_date: {max_date}, window: {since_date} → {yesterday}"
-            )
-            _do_incremental_load(session, conn, config, since_date, yesterday)
-
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {config.schema}.sharadar_sf3")
-            total = cur.fetchone()[0]
-
-    print(f"[info] {config.schema}.sharadar_sf3 now contains {total:,} rows")
-    return 0
+    args = parse_ingest_args("Ingest SHARADAR/SF3 into Postgres")
+    api_key, db_dsn = resolve_credentials()
+    config = IngestConfig(
+        api_key=api_key, db_dsn=db_dsn,
+        schema=args.schema, batch_size=args.batch_size,
+        overwrite=args.overwrite,
+    )
+    return run_ingest(
+        table_code=TABLE_CODE,
+        required_cols=REQUIRED_SF3_COLS,
+        known_cols=KNOWN_SF3_COLS,
+        date_filter_col="calendardate",
+        ensure_schema_fn=ensure_schema,
+        get_max_date_fn=get_max_calendar_date,
+        stage_and_upsert_fn=stage_and_upsert,
+        iter_rows_csv_fn=iter_rows_csv,
+        iter_rows_dicts_fn=iter_rows_dicts,
+        truncate_fn=truncate_target,
+        count_fn=count_target,
+        config=config,
+    )
 
 
 if __name__ == "__main__":
